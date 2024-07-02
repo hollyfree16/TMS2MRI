@@ -15,7 +15,7 @@ Requirements
 
 Installation
 1.	Clone the repository:
-git clone https://github.com/your-username/TMS2MRI.git
+git clone https://github.com/hollyfree16/TMS2MRI.git
 2.	Install the required Python packages:
 pip install nibabel
 
