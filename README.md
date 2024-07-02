@@ -58,4 +58,3 @@ The script generates an output CSV file named with the current date and optional
 Contact
 For any questions or suggestions, feel free to contact hjfreeman@mgh.harvard.edu
 
-![image](https://github.com/hollyfree16/TMS2MRI/assets/44854867/b0e4e272-2cce-478a-97ca-6a7031c5e658)
