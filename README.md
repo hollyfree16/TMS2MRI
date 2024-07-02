@@ -55,6 +55,8 @@ The script generates an output CSV file named with the current date and optional
 •	MNI Inverted X
 •	Inverted Atlas Region
 
+Please note, inverted X coordinates are provided in case there is L/R swapping present in the data. You will need to examine the results to verify which orientation best matches your data.
+
 Contact
 For any questions or suggestions, feel free to contact hjfreeman@mgh.harvard.edu
 
