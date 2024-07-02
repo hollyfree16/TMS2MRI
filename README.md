@@ -1,4 +1,5 @@
 TMS2MRI Data Processing Pipeline
+
 This repository contains a Python script designed to process TMS (Transcranial Magnetic Stimulation) stimulation target coordinates to MRI (Magnetic Resonance Imaging) subject space. It handles DICOM to NIfTI conversion, extracts coordinates, and queries MNI atlas locations for given brain regions. The results are saved in a CSV file.
 
 Features
