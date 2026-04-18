@@ -125,9 +125,12 @@ img    = nib.load(args.t1)
 affine = img.affine
 shape  = img.shape
 
-vox_x = abs(affine[0, 0])
-vox_y = abs(affine[1, 1])
-vox_z = abs(affine[2, 2])
+# FIX: Use column norms of the affine rotation matrix instead of the diagonal
+# elements. Oblique or LAS affines (common on some scanners) can have near-zero
+# diagonal values, causing divide-by-zero -> inf -> OverflowError downstream.
+# Column norms correctly extract voxel sizes for any valid affine orientation.
+vox_x, vox_y, vox_z = np.sqrt((affine[:3, :3] ** 2).sum(axis=0))
+
 dim_x = shape[0]
 
 t1_x_is_left_to_right = affine[0, 0] > 0
@@ -136,6 +139,13 @@ print(f"\n[T1] Loaded: {args.t1}")
 print(f"     Dimensions  : {shape[0]} x {shape[1]} x {shape[2]} voxels")
 print(f"     Voxel size  : {vox_x:.4f} x {vox_y:.4f} x {vox_z:.4f} mm")
 print(f"     X orientation: {'Left-to-Right (RAS)' if t1_x_is_left_to_right else 'Right-to-Left (LAS)'}")
+
+# Abort early with a clear message if voxel sizes are still degenerate
+if vox_x < 1e-6 or vox_y < 1e-6 or vox_z < 1e-6:
+    print(f"\nERROR: Degenerate voxel size detected ({vox_x:.6f}, {vox_y:.6f}, {vox_z:.6f} mm).")
+    print(f"       The affine matrix may be corrupt or all-zero.")
+    print(f"       Inspect with: python -c \"import nibabel as nib; print(nib.load('{args.t1}').affine)\"")
+    sys.exit(1)
 
 lm_df  = pd.read_csv(args.landmarks)
 tgt_df = pd.read_csv(args.targets, na_values=['-', ' -', '- '])
@@ -192,6 +202,10 @@ lm_mm     = voxels_to_mm(lm_vox, affine)
 print(f"\n[Landmarks] Converted to native voxels:")
 for i, row in lm_df.iterrows():
     v = lm_vox[i]
+    # FIX: guard against inf/nan before int conversion
+    if not all(np.isfinite(v[d]) for d in range(3)):
+        print(f"  {row['landmark_type']}: [{v[0]:.1f}, {v[1]:.1f}, {v[2]:.1f}]  NON-FINITE ⚠️")
+        continue
     in_b = all(0 <= int(round(v[d])) < shape[d] for d in range(3))
     print(f"  {row['landmark_type']}: [{v[0]:.0f}, {v[1]:.0f}, {v[2]:.0f}]  {'OK' if in_b else 'OUT OF BOUNDS ⚠️'}")
 
@@ -230,8 +244,11 @@ if coil_mask.any():
 # Bounds check
 def count_in_bounds(vox, shape):
     mask = ~np.isnan(vox).any(axis=1)
-    v    = np.round(vox[mask]).astype(int)
-    n_ok = sum(all(0 <= v[i, d] < shape[d] for d in range(3)) for i in range(len(v)))
+    v    = vox[mask]
+    # FIX: skip non-finite rows to avoid OverflowError on int(inf)
+    finite_mask = np.all(np.isfinite(v), axis=1)
+    v_finite    = np.round(v[finite_mask]).astype(int)
+    n_ok = sum(all(0 <= v_finite[i, d] < shape[d] for d in range(3)) for i in range(len(v_finite)))
     return n_ok, mask.sum()
 
 ef_ok, ef_total     = count_in_bounds(ef_vox,   shape)
@@ -273,7 +290,7 @@ if DO_MNI:
     import subprocess
 
     # -------------------------------------------------------------------------
-    # STEP 4a: Brain extraction using SynthStrip (nipreps-synthstrip)
+    # STEP 4a: Brain extraction using SynthStrip
     # -------------------------------------------------------------------------
     if os.path.exists(brain_path):
         print(f"\n[MNI] Brain extraction — reusing existing: {brain_path}")
@@ -298,11 +315,11 @@ if DO_MNI:
         cmd = [
             "antsRegistrationSyN.sh",
             "-d", "3",
-            "-f", args.mni_template,       # fixed:  MNI152 brain
-            "-m", brain_path,              # moving: subject brain
-            "-o", reg_prefix,              # output prefix
-            "-t", "s",                     # SyN: rigid + affine + deformable
-            "-n", "4"                      # threads
+            "-f", args.mni_template,
+            "-m", brain_path,
+            "-o", reg_prefix,
+            "-t", "s",
+            "-n", "4"
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -321,8 +338,6 @@ if DO_MNI:
 
     # -------------------------------------------------------------------------
     # STEP 4c: Apply warp to full-head T1 for visualization
-    # antsApplyTransforms -d 3 -i T1.nii.gz -r MNI_full.nii.gz
-    #                     -t Warp.nii.gz -t Affine.mat -o T1_in_MNI.nii.gz
     # -------------------------------------------------------------------------
     if args.mni_template_full:
         if os.path.exists(t1_mni_path):
@@ -348,21 +363,6 @@ if DO_MNI:
 
     # -------------------------------------------------------------------------
     # STEP 4d: Apply warp to coordinates via antsApplyTransformsToPoints
-    #
-    # antsApplyTransformsToPoints expects a CSV with columns x,y,z in LPS mm.
-    # Our native coords are in RAS mm (from nibabel affine), so we flip
-    # X and Y before passing to ANTs, then flip back afterwards.
-    #
-    # Pipeline:
-    #   native voxels -> RAS mm (nibabel affine)
-    #   -> LPS mm (flip X,Y)
-    #   -> antsApplyTransformsToPoints (using INVERSE transforms for points)
-    #   -> LPS mm -> RAS mm (flip X,Y back)
-    #   -> MNI voxels (MNI inverse affine)
-    #
-    # NOTE: For point transforms, ANTs requires the INVERSE transforms:
-    #   -t [Warp_inv.nii.gz] -t [Affine.mat, 1]
-    # antsRegistrationSyN.sh saves both forward and inverse warps.
     # -------------------------------------------------------------------------
     print(f"\n[MNI] Transforming coordinates to MNI space...")
 
@@ -394,10 +394,6 @@ if DO_MNI:
     import tempfile
 
     def apply_mni_transform_to_points(mm_native_ras, mask):
-        """
-        Transform a set of RAS mm coords to MNI RAS mm using ANTs point transform.
-        Returns full array (NaN for rows where mask is False).
-        """
         result = np.full(mm_native_ras.shape, np.nan)
         if not mask.any():
             return result
@@ -405,7 +401,6 @@ if DO_MNI:
         valid_ras = mm_native_ras[mask]
         valid_lps = ras_to_lps(valid_ras)
 
-        # Write LPS points to temp CSV — ANTs format: x,y,z,t (t=0)
         with tempfile.NamedTemporaryFile(suffix=".csv", mode='w', delete=False) as f:
             pts_in_path = f.name
             f.write("x,y,z,t\n")
@@ -419,8 +414,8 @@ if DO_MNI:
             "-d", "3",
             "-i", pts_in_path,
             "-o", pts_out_path,
-            "-t", f"[{affine_path},1]",      # inverse affine
-            "-t", inv_warp_path,              # inverse warp
+            "-t", f"[{affine_path},1]",
+            "-t", inv_warp_path,
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
@@ -442,7 +437,6 @@ if DO_MNI:
     coil_mni_mm = apply_mni_transform_to_points(coil_mm_native, coil_mask)
     lm_mni_mm   = apply_mni_transform_to_points(lm_mm, np.ones(len(lm_mm), dtype=bool))
 
-    # MNI mm (RAS) -> MNI voxel indices
     ef_mni_vox[ef_mask]     = mm_to_voxels(ef_mni_mm[ef_mask],     mni_inv_affine)
     coil_mni_vox[coil_mask] = mm_to_voxels(coil_mni_mm[coil_mask], mni_inv_affine)
     lm_mni_vox              = mm_to_voxels(lm_mni_mm,              mni_inv_affine)
