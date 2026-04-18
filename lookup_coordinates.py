@@ -7,7 +7,7 @@ Usage:
     python lookup_by_coords.py --csv targets_TEP004.csv --x 833.5 --y 567.2 --z 522.3
 
     # Looser tolerance if needed
-    python lookup_by_coords.py --csv targets_TEP004.csv --x 833.5 --y 567.2 --z 522.3 --tol 1.0
+    python lookup_by_coords.py --csv targets_TEP004.csv --x 833.5 --y 567.2 --z 522.3 --tol 0.1
 """
 
 import argparse
@@ -22,8 +22,8 @@ parser.add_argument("--csv", required=True, help="Path to targets CSV")
 parser.add_argument("--x",   required=True, type=float, help="EF max loc X (mm)")
 parser.add_argument("--y",   required=True, type=float, help="EF max loc Y (mm)")
 parser.add_argument("--z",   required=True, type=float, help="EF max loc Z (mm)")
-parser.add_argument("--tol", type=float, default=0.1,
-                    help="Match tolerance in mm (default: 0.1)")
+parser.add_argument("--tol", type=float, default=0.0,
+                    help="Match tolerance in mm (default: 0.0 — exact match)")
 args = parser.parse_args()
 
 df = pd.read_csv(args.csv, na_values=['-', ' -', '- '])
@@ -49,7 +49,7 @@ if matches.empty:
         (df[z_col] - args.z) ** 2
     )
     closest = df.nsmallest(3, "_dist")[["id", x_col, y_col, z_col, "_dist"]]
-    print(f"\nNo match for ({args.x}, {args.y}, {args.z}) within ±{args.tol}mm.")
+    print(f"\nNo exact match for ({args.x}, {args.y}, {args.z}).")
     print(f"\nClosest rows:\n")
     print(closest.rename(columns={"_dist": "distance_mm"}).to_string(index=False))
     print(f"\nTip: rerun with --tol {df['_dist'].min():.2f}")
