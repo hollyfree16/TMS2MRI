@@ -1,0 +1,24 @@
+# tms2mni requirements
+# Install with: pip install -r requirements.txt
+
+# Core neuroimaging
+nibabel>=4.0
+nilearn>=0.10
+
+# Numerics
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+
+# Visualisation
+matplotlib>=3.7
+
+# Excel output (optional — targets.xlsx only)
+openpyxl>=3.1
+
+# External tools required but not pip-installable:
+#   FreeSurfer >= 7.0  (mri_synthstrip)  https://surfer.nmr.mgh.harvard.edu/
+#   FSL >= 6.0         (bet)             https://fsl.fmrib.ox.ac.uk/
+#   ANTs >= 2.4        (antsRegistrationSyN.sh, antsApplyTransforms,
+#                       antsApplyTransformsToPoints)
+#                                        https://github.com/ANTsX/ANTs
