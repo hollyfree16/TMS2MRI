@@ -8,12 +8,16 @@ Stage 04: Convert NextStim NBE coordinates to:
 Automatic flip retry
 --------------------
 If the hemisphere check fails OR all EF coordinates land outside the image
-volume (both reliable signs that the X flip is wrong), the stage automatically
-retries with the opposite flip and logs a warning. This is common for LAS
-images where the default flip produces inverted coords.
+volume, the stage automatically retries with the opposite flip and logs a
+warning. Common for LAS images.
 
-The flip that was actually used is recorded in a 'flip_x_used' column in
-both output CSVs so the decision is always auditable.
+Orientation-aware ANTs point transform
+---------------------------------------
+antsApplyTransformsToPoints expects LPS physical coordinates in the same
+physical space as the moving image. For non-RAS images (PIR, LAS etc) the
+physical coords from voxels_to_mm() are NOT in RAS — they are in scanner
+physical space. We use nibabel's orientation transform to reorient to RAS
+first, then negate X/Y for LPS, before passing to ANTs.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import os
 import subprocess
 import tempfile
 
+import nibabel.orientations as ornt
 import numpy as np
 import nibabel as nib
 import pandas as pd
@@ -31,8 +36,6 @@ from utils.affine import (
     voxel_sizes_from_affine,
     voxels_to_mm,
     mm_to_voxels,
-    ras_to_lps,
-    lps_to_ras,
     label_hemisphere,
     hemisphere_check,
 )
@@ -70,6 +73,11 @@ def run(args, paths: PathManifest) -> None:
     log.info("X orientation  : %s",
              "Left-to-Right (RAS)" if t1_ltr else "Right-to-Left (LAS)")
 
+    # Log the physical orientation so it's always auditable
+    current_ornt = ornt.io_orientation(affine)
+    ornt_codes   = ornt.ornt2axcodes(current_ornt)
+    log.info("Physical space : %s", "".join(ornt_codes))
+
     tgt_df = read_targets(paths.targets_csv)
     lm_df  = read_landmarks(paths.landmarks_csv)
     log.info("Targets        : %d rows", len(tgt_df))
@@ -88,9 +96,9 @@ def run(args, paths: PathManifest) -> None:
     # ------------------------------------------------------------------ #
     # Automatic retry check
     # ------------------------------------------------------------------ #
-    hemi_ok          = result["hemi_correct"]
-    ef_in, ef_total  = result["ef_bounds"]
-    all_oob          = (ef_total > 0) and (ef_in == 0)
+    hemi_ok         = result["hemi_correct"]
+    ef_in, ef_total = result["ef_bounds"]
+    all_oob         = (ef_total > 0) and (ef_in == 0)
 
     if hemi_ok is False or all_oob:
         reasons = []
@@ -124,7 +132,7 @@ def run(args, paths: PathManifest) -> None:
                 "Keeping flip_x=%s. Manual review recommended.", flip_x)
 
     # ------------------------------------------------------------------ #
-    # Unpack and save
+    # Unpack and save native CSV
     # ------------------------------------------------------------------ #
     lm_vox    = result["lm_vox"]
     lm_mm     = result["lm_mm"]
@@ -170,10 +178,10 @@ def run(args, paths: PathManifest) -> None:
 
     mni_img = nib.load(str(paths.mni_template))
 
-    ef_mni_mm   = _apply_ants_transform(ef_mm,   ef_mask,   paths)
-    coil_mni_mm = _apply_ants_transform(coil_mm, coil_mask, paths)
+    ef_mni_mm   = _apply_ants_transform(ef_mm,   ef_mask,   paths, affine)
+    coil_mni_mm = _apply_ants_transform(coil_mm, coil_mask, paths, affine)
     lm_mni_mm   = _apply_ants_transform(
-        lm_mm, np.ones(len(lm_mm), dtype=bool), paths)
+        lm_mm, np.ones(len(lm_mm), dtype=bool), paths, affine)
 
     ef_mni_vox   = np.full(ef_mni_mm.shape,   np.nan)
     coil_mni_vox = np.full(coil_mni_mm.shape, np.nan)
@@ -185,6 +193,7 @@ def run(args, paths: PathManifest) -> None:
         m = lm_mni_mm[i]
         log.info("  %-20s  [%6.1f %6.1f %6.1f]",
                  row["landmark_type"], m[0], m[1], m[2])
+    log.info("  (sanity: nasion ~[0,+80,-40], ears ~[+/-70,-10,-40])")
 
     mni_df = tgt_df.copy()
     for axis, idx in [("x", 0), ("y", 1), ("z", 2)]:
@@ -209,10 +218,7 @@ def _attempt(
     dim_x, vox_x, vox_y, vox_z,
     affine, shape, x_midpoint, t1_ltr,
 ) -> dict:
-    """
-    Run one full NBE → voxel → mm conversion attempt for a given flip_x.
-    Returns a diagnostic dict so the caller can compare two attempts.
-    """
+    """One full NBE → voxel → mm conversion attempt for a given flip_x."""
     lm_coords = lm_df[["x", "y", "z"]].values.astype(float)
     lm_vox    = nextstim_to_mri_voxels(
         lm_coords, dim_x, vox_x, vox_y, vox_z, flip_x)
@@ -264,32 +270,66 @@ def _attempt(
         log.warning("Coil: %d coordinate(s) outside image volume", coil_total - coil_in)
 
     return dict(
-        flip_x      = flip_x,
-        lm_vox      = lm_vox,
-        lm_mm       = lm_mm,
-        ef_vox      = ef_vox,
-        ef_mm       = ef_mm,
-        ef_mask     = ef_mask,
-        coil_vox    = coil_vox,
-        coil_mm     = coil_mm,
-        coil_mask   = coil_mask,
+        flip_x       = flip_x,
+        lm_vox       = lm_vox,
+        lm_mm        = lm_mm,
+        ef_vox       = ef_vox,
+        ef_mm        = ef_mm,
+        ef_mask      = ef_mask,
+        coil_vox     = coil_vox,
+        coil_mm      = coil_mm,
+        coil_mask    = coil_mask,
         hemi_correct = hemi_ok,
-        ef_bounds   = (ef_in, ef_total),
-        coil_bounds = (coil_in, coil_total),
+        ef_bounds    = (ef_in, ef_total),
+        coil_bounds  = (coil_in, coil_total),
     )
 
 
+def _physical_to_ras(coords: np.ndarray, affine: np.ndarray) -> np.ndarray:
+    """
+    Reorient Nx3 coordinates from native scanner physical space to RAS.
+
+    voxels_to_mm() returns coordinates in the scanner's physical space
+    (e.g. PIR, LAS), not necessarily RAS. ANTs needs LPS, which is derived
+    from RAS by negating X and Y — so we must get to RAS first.
+    """
+    current_ornt = ornt.io_orientation(affine)
+    ras_ornt     = np.array([[0, 1], [1, 1], [2, 1]])
+    transform    = ornt.ornt_transform(current_ornt, ras_ornt)
+
+    result = coords.copy().astype(float)
+    for out_ax, (in_ax, flip) in enumerate(transform):
+        result[:, int(out_ax)] = coords[:, int(in_ax)] * flip
+    return result
+
+
 def _apply_ants_transform(
-    mm_native_ras: np.ndarray,
-    mask:          np.ndarray,
-    paths:         PathManifest,
+    mm_native:  np.ndarray,
+    mask:       np.ndarray,
+    paths:      PathManifest,
+    affine:     np.ndarray,
 ) -> np.ndarray:
-    """Transform Nx3 native RAS mm → MNI RAS mm via antsApplyTransformsToPoints."""
-    result = np.full(mm_native_ras.shape, np.nan)
+    """
+    Transform Nx3 native physical mm coordinates to MNI RAS mm via
+    antsApplyTransformsToPoints.
+
+    Pipeline:
+      native physical → RAS  (orientation-aware reorient)
+      RAS → LPS              (negate X and Y — what ANTs expects)
+      ANTs transform
+      LPS → RAS              (negate X and Y on output)
+    """
+    result = np.full(mm_native.shape, np.nan)
     if not mask.any():
         return result
 
-    valid_lps = ras_to_lps(mm_native_ras[mask])
+    # Native physical → RAS
+    valid_ras = _physical_to_ras(mm_native[mask], affine)
+
+    # RAS → LPS for ANTs
+    valid_lps = valid_ras.copy()
+    valid_lps[:, 0] *= -1
+    valid_lps[:, 1] *= -1
 
     with tempfile.NamedTemporaryFile(
             suffix=".csv", mode="w", delete=False, dir="/tmp") as f:
@@ -317,7 +357,13 @@ def _apply_ants_transform(
         raise RuntimeError("ANTs point transform failed — see log for details.")
 
     out_lps = pd.read_csv(pts_out)[["x", "y", "z"]].values
-    result[mask] = lps_to_ras(out_lps)
+
+    # LPS → RAS
+    out_ras = out_lps.copy()
+    out_ras[:, 0] *= -1
+    out_ras[:, 1] *= -1
+
+    result[mask] = out_ras
 
     os.unlink(pts_in)
     os.unlink(pts_out)
