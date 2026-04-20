@@ -139,13 +139,40 @@ import sys, json
 mesh = sys.argv[1]
 out  = sys.argv[2]
 
-from nilearn import datasets, surface as surf
+from nilearn import datasets
+import nibabel as nib
 import numpy as np
 
 fs = datasets.fetch_surf_fsaverage(mesh)
+
+def load_mesh(path):
+    path = str(path)
+    # Try nibabel FreeSurfer format first
+    try:
+        coords, faces = nib.freesurfer.read_geometry(path)
+        return coords, faces
+    except Exception:
+        pass
+    # Try GIFTI
+    try:
+        img = nib.load(path)
+        arrays = img.darrays
+        coords = arrays[0].data
+        faces  = arrays[1].data
+        return coords, faces
+    except Exception:
+        pass
+    # Try nilearn as last resort
+    try:
+        from nilearn import surface as surf
+        coords, faces = surf.load_surf_mesh(path)
+        return coords, faces
+    except Exception as e:
+        raise RuntimeError(f"Could not load surface {path}: {e}")
+
 result = {}
-for key in ['pial_left', 'pial_right', 'sulc_left', 'sulc_right']:
-    coords, faces = surf.load_surf_mesh(fs[key])
+for key in ['pial_left', 'pial_right']:
+    coords, faces = load_mesh(fs[key])
     result[key] = {
         'coords': coords.tolist(),
         'faces':  faces.tolist(),
