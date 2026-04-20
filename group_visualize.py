@@ -268,7 +268,7 @@ def _plot_interactive(combined: pd.DataFrame, legend_info: list, out_dir: str, p
     colors = []
     for _, row in combined.iterrows():
         light, deep = _site_colors(SITE_BASE_COLORS[int(row["_csv_index"])])
-        colors.append(light if row["hemisphere"] == "L" else deep)
+        colors.append(light if row["mni_hemisphere"] == "L" else deep)
 
     coords = combined[["mni_mm_x", "mni_mm_y", "mni_mm_z"]].values
     view = plotting.view_markers(coords, marker_color=colors, marker_size=MARKER_SIZE)
