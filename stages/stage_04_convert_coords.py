@@ -219,7 +219,9 @@ def _attempt(
     affine, shape, x_midpoint, t1_ltr,
 ) -> dict:
     """One full NBE → voxel → mm conversion attempt for a given flip_x."""
-    lm_coords = lm_df[["x", "y", "z"]].values.astype(float)
+    lm_coords = lm_df[["x", "y", "z"]].apply(
+        pd.to_numeric, errors="coerce"
+    ).values.astype(float)
     lm_vox    = nextstim_to_mri_voxels(
         lm_coords, dim_x, vox_x, vox_y, vox_z, flip_x)
     lm_mm     = voxels_to_mm(lm_vox, affine)
@@ -245,7 +247,9 @@ def _attempt(
         log.info("Hemisphere check : skipped — landmarks missing (flip_x=%s)", flip_x)
 
     def _conv(x_col, y_col, z_col):
-        coords = tgt_df[[x_col, y_col, z_col]].values.astype(float)
+        coords = tgt_df[[x_col, y_col, z_col]].apply(
+            pd.to_numeric, errors="coerce"
+        ).values.astype(float)
         mask   = ~np.isnan(coords).any(axis=1)
         vox    = np.full(coords.shape, np.nan)
         if mask.any():
