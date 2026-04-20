@@ -9,6 +9,7 @@ Chains:
   03  register_mni    — T1_brain → MNI152  (ANTs SyN)
   04  convert_coords  — NBE → native voxels/mm → MNI mm
   05  visualize       — nilearn glass brain + shared CSV
+  06  snap_surface    — MNI mm → nearest fsaverage pial vertex
 
 Usage
 -----
@@ -35,6 +36,7 @@ from stages import (
     stage_03_register_mni   as s03,
     stage_04_convert_coords as s04,
     stage_05_visualize      as s05,
+    stage_06_snap_surface   as s06,
 )
 
 
@@ -72,7 +74,7 @@ def main() -> None:
     run_stage("parse",     s01.run, args, paths, force=force)
 
     run_stage("skullstrip", s02.run, args, paths,
-              enabled = do_mni,     # only needed for MNI registration
+              enabled = do_mni,
               force   = force)
 
     run_stage("register",  s03.run, args, paths,
@@ -83,6 +85,10 @@ def main() -> None:
 
     run_stage("visualize", s05.run, args, paths,
               enabled = (args.ids is not None) and not args.skip_viz,
+              force   = force)
+
+    run_stage("snap",      s06.run, args, paths,
+              enabled = do_mni and not args.skip_snap,
               force   = force)
 
     # ------------------------------------------------------------------ #

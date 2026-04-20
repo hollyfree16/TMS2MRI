@@ -67,6 +67,9 @@ class PathManifest:
     html_out:         Path
     png_out:          Path
 
+    # 06_snap_surface
+    targets_fsaverage: Path | None  # only if mni registration enabled
+
     # --- Shared CSV (optional, cross-subject) ---
     shared_csv:       Path | None   = None
 
@@ -130,6 +133,9 @@ class PathManifest:
             html_out          = viz / "stimulation_sites.html",
             png_out           = viz / "stimulation_sites.png",
 
+            # 06
+            targets_fsaverage = (coords / "targets_fsaverage.csv") if mni_template else None,
+
             # optional
             shared_csv        = shared_csv,
         )
@@ -145,7 +151,8 @@ class PathManifest:
         Return the list of output paths that determine whether a stage
         can be skipped (all must exist).
 
-        stage: one of 'parse', 'skullstrip', 'register', 'convert', 'visualize'
+        stage: one of 'parse', 'skullstrip', 'register', 'convert',
+               'visualize', 'snap'
         """
         if stage == "parse":
             return [self.landmarks_csv, self.targets_csv]
@@ -163,6 +170,10 @@ class PathManifest:
             return outs
         if stage == "visualize":
             return [self.html_out, self.png_out]
+        if stage == "snap":
+            if self.targets_fsaverage:
+                return [self.targets_fsaverage]
+            return []
         raise ValueError(f"Unknown stage: {stage!r}")
 
 

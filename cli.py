@@ -103,6 +103,25 @@ Examples
                      help="Marker size for glass brain plot (default: 5)")
 
     # ------------------------------------------------------------------ #
+    # Surface snapping (stage 06)
+    # ------------------------------------------------------------------ #
+    snap = p.add_argument_group("surface snapping (stage 06)")
+    snap.add_argument(
+        "--fsaverage-mesh",
+        default="fsaverage",
+        choices=["fsaverage", "fsaverage5", "fsaverage6"],
+        help="fsaverage mesh resolution for surface snapping. "
+             "fsaverage  = 163,842 vertices/hemi (~0.7 mm, default). "
+             "fsaverage6 =  40,962 vertices/hemi (~1.5 mm). "
+             "fsaverage5 =  10,242 vertices/hemi (~3.5 mm, fastest).",
+    )
+    snap.add_argument(
+        "--skip-snap", action="store_true",
+        help="Skip stage 06 (surface snapping) even when MNI registration "
+             "is available.",
+    )
+
+    # ------------------------------------------------------------------ #
     # Shared CSV
     # ------------------------------------------------------------------ #
     shared = p.add_argument_group("shared / multi-subject output")

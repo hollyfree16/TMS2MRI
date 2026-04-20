@@ -12,6 +12,8 @@ and deep variants of that colour.
 Also produces:
   - A density heatmap overlay
   - Harvard-Oxford cortical atlas region labels
+  - An inflated brain plot using fsaverage surface-snapped coordinates
+    (reads targets_fsaverage.csv files produced by stage 06)
   - A combined output CSV
 
 Requirements
@@ -29,6 +31,13 @@ Usage
   # Single pre-combined CSV
   python group_visualize.py \\
       --csv all_subjects.csv \\
+      --output-dir ./group_viz
+
+  # With per-subject fsaverage CSVs for inflated brain plot
+  python group_visualize.py \\
+      --csv all_subjects.csv \\
+      --fsaverage-csv sub01/coordinates/targets_fsaverage.csv \\
+      --fsaverage-csv sub02/coordinates/targets_fsaverage.csv \\
       --output-dir ./group_viz
 
   # Skip heatmap or atlas labelling
@@ -85,6 +94,13 @@ HO_PROBABILITY_THRESHOLD = 25
 
 REQUIRED_COLS = ["subject_id", "site", "mni_mm_x", "mni_mm_y", "mni_mm_z", "hemisphere"]
 
+# Columns required in a targets_fsaverage.csv for the inflated brain plot
+FSAVERAGE_REQUIRED_COLS = [
+    "ef_mni_mm_x", "ef_mni_mm_y", "ef_mni_mm_z",
+    "fs_x", "fs_y", "fs_z",
+    "fs_surface", "ef_hemisphere",
+]
+
 
 # =============================================================================
 # Colour helpers
@@ -127,6 +143,28 @@ def _parse_args() -> argparse.Namespace:
                    help="Skip heatmap generation")
     p.add_argument("--no-atlas",      action="store_true",
                    help="Skip Harvard-Oxford atlas labelling")
+    p.add_argument(
+        "--fsaverage-csv",
+        action="append",
+        dest="fsaverage_csvs",
+        default=None,
+        metavar="PATH",
+        help="Path to a per-subject targets_fsaverage.csv (produced by stage 06). "
+             "Repeat for multiple subjects. When provided, an additional inflated "
+             "brain plot is generated using the surface-snapped coordinates.",
+    )
+    p.add_argument(
+        "--fsaverage-mesh",
+        default="fsaverage",
+        choices=["fsaverage", "fsaverage5", "fsaverage6"],
+        help="fsaverage mesh resolution to use for the inflated brain plot "
+             "(default: fsaverage). Must match the mesh used in stage 06.",
+    )
+    p.add_argument(
+        "--no-inflated",
+        action="store_true",
+        help="Skip the inflated brain plot even if --fsaverage-csv is provided.",
+    )
     p.add_argument("--log-level",     default="INFO",
                    choices=["DEBUG", "INFO", "WARNING"])
     return p.parse_args()
@@ -166,6 +204,60 @@ def _load_csvs(csv_paths: list[str]) -> tuple[pd.DataFrame, list[str]]:
     )
     log.info("Total: %d points across %d site(s)", len(combined), len(csv_paths))
     return combined, site_labels
+
+
+def _load_fsaverage_csvs(
+    csv_paths: list[str],
+    site_labels: list[str],
+) -> pd.DataFrame | None:
+    """
+    Load and concatenate per-subject targets_fsaverage.csv files.
+
+    Returns a combined DataFrame or None if loading fails.
+    """
+    all_dfs = []
+
+    for path in csv_paths:
+        try:
+            df = pd.read_csv(path, na_values=["-", " -", "- "])
+        except Exception as e:
+            log.error("Could not read fsaverage CSV %s: %s", path, e)
+            return None
+
+        missing_cols = [c for c in FSAVERAGE_REQUIRED_COLS if c not in df.columns]
+        if missing_cols:
+            log.error(
+                "fsaverage CSV %s is missing columns %s — "
+                "was stage 06 run for this subject?", path, missing_cols
+            )
+            return None
+
+        df = df.dropna(subset=["fs_x", "fs_y", "fs_z"])
+
+        # Attach site label if available (use 'site' col if present, else filename)
+        if "site" not in df.columns:
+            df["site"] = os.path.basename(path)
+
+        # Map site label → colour index using the same order as the main CSVs
+        def _site_to_idx(s):
+            try:
+                return site_labels.index(s)
+            except ValueError:
+                return 0
+
+        df["_csv_index"] = df["site"].apply(_site_to_idx)
+        all_dfs.append(df)
+
+        log.info(
+            "fsaverage CSV: %d valid snapped points from %s", len(df), path
+        )
+
+    if not all_dfs:
+        return None
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+    log.info("Total snapped points for inflated brain: %d", len(combined))
+    return combined
 
 
 # =============================================================================
@@ -221,6 +313,195 @@ def _plot_static(combined: pd.DataFrame, legend_info: list, out_dir: str, prefix
 
 
 # =============================================================================
+# Inflated brain plot (stage 06 snapped coordinates)
+# =============================================================================
+
+def _plot_inflated(
+    fs_combined: pd.DataFrame,
+    legend_info: list,
+    out_dir: str,
+    prefix: str,
+    mesh: str = "fsaverage",
+) -> None:
+    """
+    Plot surface-snapped stimulation coordinates on fsaverage inflated brain.
+
+    Uses the fs_x/fs_y/fs_z columns from targets_fsaverage.csv (which are
+    pial surface coordinates) projected onto the inflated surface for display.
+    The inflated surface shares the same vertex indices as the pial surface,
+    so we can use the saved fs_vertex index to look up inflated coordinates
+    directly — giving a clean snap with no additional nearest-vertex search.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+
+    log.info("Loading fsaverage surfaces for inflated brain plot (mesh=%s)...", mesh)
+
+    fsaverage = datasets.fetch_surf_fsaverage(mesh)
+
+    # We need inflated coords for display but pial vertex indices for mapping.
+    # nilearn's plot_surf lets us pass coordinates directly via surf_mesh,
+    # but the simplest approach is to use plot_surf_stat_map / plot_surf with
+    # a per-vertex colour texture.
+    from nilearn import surface as surf
+
+    infl_lh_coords, infl_lh_faces = surf.load_surf_mesh(fsaverage["infl_left"])
+    infl_rh_coords, infl_rh_faces = surf.load_surf_mesh(fsaverage["infl_right"])
+
+    n_lh = len(infl_lh_coords)
+    n_rh = len(infl_rh_coords)
+
+    log.info("Inflated LH: %d vertices  RH: %d vertices", n_lh, n_rh)
+
+    # Build a per-vertex colour texture for each hemisphere.
+    # Background = light grey; stimulation vertices = site colour.
+    BG_INTENSITY  = 0.82   # grey level for background vertices
+    SPOT_RADIUS   = 3      # spread marker over nearest N-ring neighbours
+
+    # We use a scalar texture and a custom colormap rather than per-vertex
+    # RGB (nilearn's plot_surf accepts a 1D stat array).  Encoding: each
+    # site gets a unique integer > 0; background = 0.
+
+    lh_texture = np.zeros(n_lh, dtype=float)
+    rh_texture = np.zeros(n_rh, dtype=float)
+
+    # Build adjacency for spreading markers over a small neighbourhood
+    lh_adj = _build_adjacency(infl_lh_faces, n_lh)
+    rh_adj = _build_adjacency(infl_rh_faces, n_rh)
+
+    site_vertex_map: dict[int, list[int]] = {}   # csv_index → vertex list
+
+    for _, row in fs_combined.iterrows():
+        vertex_idx = row.get("fs_vertex")
+        surface    = row.get("fs_surface", "")
+        csv_idx    = int(row.get("_csv_index", 0))
+
+        if pd.isna(vertex_idx):
+            continue
+
+        vertex_idx = int(vertex_idx)
+        val        = float(csv_idx + 1)   # 1-based so background stays 0
+
+        if "left" in str(surface):
+            neighbours = _k_ring(lh_adj, vertex_idx, SPOT_RADIUS)
+            for v in neighbours:
+                lh_texture[v] = val
+        else:
+            neighbours = _k_ring(rh_adj, vertex_idx, SPOT_RADIUS)
+            for v in neighbours:
+                rh_texture[v] = val
+
+        site_vertex_map.setdefault(csv_idx, []).append(vertex_idx)
+
+    n_sites = len(legend_info)
+
+    # Build a colormap: index 0 = background grey, indices 1..n_sites = site colours
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+
+    cmap_colors = [(BG_INTENSITY, BG_INTENSITY, BG_INTENSITY, 1.0)]  # background
+    for _, base, light, deep in legend_info:
+        # Use the base colour for the surface marker (single colour per site,
+        # hemisphere split is already conveyed by which surface it lands on)
+        r, g, b = _hex_to_rgb(base)
+        cmap_colors.append((r, g, b, 1.0))
+
+    cmap   = ListedColormap(cmap_colors)
+    bounds = np.arange(-0.5, n_sites + 1.5)
+    norm   = BoundaryNorm(bounds, cmap.N)
+
+    vmin, vmax = 0, n_sites
+
+    # Four panels: LH lateral, LH medial, RH lateral, RH medial
+    views = [
+        ("left",  "lateral", lh_texture, fsaverage["infl_left"],  fsaverage["sulc_left"]),
+        ("left",  "medial",  lh_texture, fsaverage["infl_left"],  fsaverage["sulc_left"]),
+        ("right", "lateral", rh_texture, fsaverage["infl_right"], fsaverage["sulc_right"]),
+        ("right", "medial",  rh_texture, fsaverage["infl_right"], fsaverage["sulc_right"]),
+    ]
+
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4),
+                             subplot_kw={"projection": "3d"},
+                             facecolor="white")
+    fig.subplots_adjust(wspace=0.01)
+
+    titles = ["LH lateral", "LH medial", "RH lateral", "RH medial"]
+
+    for ax, title, (hemi, view, texture, infl_path, sulc_path) in zip(
+        axes, titles, views
+    ):
+        plotting.plot_surf(
+            infl_path,
+            surf_map=texture,
+            hemi=hemi,
+            view=view,
+            bg_map=sulc_path,
+            bg_on_data=True,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            colorbar=False,
+            axes=ax,
+            figure=fig,
+        )
+        ax.set_title(title, fontsize=9, pad=2)
+
+    # Legend
+    patches = []
+    for site_label, base, light, deep in legend_info:
+        r, g, b = _hex_to_rgb(base)
+        patches.append(
+            mpatches.Patch(color=(r, g, b), label=site_label)
+        )
+    fig.legend(
+        handles=patches,
+        loc="lower center",
+        ncol=len(legend_info),
+        fontsize=9,
+        frameon=False,
+        bbox_to_anchor=(0.5, -0.04),
+    )
+
+    path = os.path.join(out_dir, f"{prefix}_inflated_brain.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close()
+    log.info("Inflated brain : %s", path)
+
+    # Log per-site vertex counts
+    for csv_idx, vertices in site_vertex_map.items():
+        if csv_idx < len(legend_info):
+            log.info(
+                "  Site %-12s : %d points on surface",
+                legend_info[csv_idx][0], len(vertices),
+            )
+
+
+def _build_adjacency(faces: np.ndarray, n_vertices: int) -> list[set]:
+    """Build a vertex adjacency list from a triangle mesh face array."""
+    adj: list[set] = [set() for _ in range(n_vertices)]
+    for v0, v1, v2 in faces:
+        adj[v0].add(v1); adj[v0].add(v2)
+        adj[v1].add(v0); adj[v1].add(v2)
+        adj[v2].add(v0); adj[v2].add(v1)
+    return adj
+
+
+def _k_ring(adj: list[set], seed: int, k: int) -> set[int]:
+    """Return all vertices within k hops of seed (inclusive)."""
+    ring    = {seed}
+    current = {seed}
+    for _ in range(k):
+        nxt = set()
+        for v in current:
+            nxt.update(adj[v])
+        nxt -= ring
+        ring.update(nxt)
+        current = nxt
+        if not current:
+            break
+    return ring
+
+
+# =============================================================================
 # Heatmap
 # =============================================================================
 
@@ -250,7 +531,6 @@ def _build_heatmap(combined: pd.DataFrame, out_dir: str, prefix: str) -> None:
     threshold = density.max() * 0.05
     density[density < threshold] = 0
 
-    # Normalise to point count units
     unit = np.zeros(mni_shape, dtype=np.float32)
     cx, cy, cz = [s // 2 for s in mni_shape]
     unit[cx, cy, cz] = 1.0
@@ -329,7 +609,6 @@ def _atlas_label(combined: pd.DataFrame, out_dir: str, prefix: str,
     for region, count in region_counts.head(10).items():
         log.info("  %4d  %s", count, region)
 
-    # Plot: region outlines + stimulation points
     targeted = sorted(
         combined[combined["ho_region"] != "no_region"]["ho_region"].dropna().unique()
     )
@@ -420,6 +699,25 @@ def main() -> None:
 
     if not args.no_atlas:
         combined = _atlas_label(combined, args.output_dir, args.output_prefix, legend_info)
+
+    # Inflated brain plot
+    if args.fsaverage_csvs and not args.no_inflated:
+        fs_combined = _load_fsaverage_csvs(args.fsaverage_csvs, site_labels)
+        if fs_combined is not None and not fs_combined.empty:
+            _plot_inflated(
+                fs_combined, legend_info,
+                args.output_dir, args.output_prefix,
+                mesh=args.fsaverage_mesh,
+            )
+        else:
+            log.warning("No valid fsaverage coordinates found — skipping inflated brain plot.")
+    elif args.fsaverage_csvs and args.no_inflated:
+        log.info("--no-inflated set — skipping inflated brain plot.")
+    else:
+        log.info(
+            "No --fsaverage-csv provided — skipping inflated brain plot. "
+            "Run stage 06 per subject and pass --fsaverage-csv to enable it."
+        )
 
     # Output CSV
     out_cols = ["subject_id", "site", "mni_mm_x", "mni_mm_y", "mni_mm_z",

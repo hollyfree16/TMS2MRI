@@ -56,7 +56,8 @@ def run_stage(
     Parameters
     ----------
     name:     Short stage name matching PathManifest.stage_outputs() keys
-              (e.g. 'parse', 'skullstrip', 'register', 'convert', 'visualize').
+              ('parse', 'skullstrip', 'register', 'convert', 'visualize',
+               'snap').
     fn:       Stage callable — signature fn(args, paths) -> None.
     args:     Parsed CLI namespace.
     paths:    PathManifest for this subject.
@@ -129,7 +130,7 @@ def report(paths: PathManifest, subject_id: str) -> None:
     Log a human-readable summary of all expected outputs and their status.
     Called at the end of run_tms2mni.py.
     """
-    stages = ["parse", "skullstrip", "register", "convert", "visualize"]
+    stages = ["parse", "skullstrip", "register", "convert", "visualize", "snap"]
 
     log.info("")
     log.info("=" * 60)
@@ -144,6 +145,9 @@ def report(paths: PathManifest, subject_id: str) -> None:
         try:
             outputs = paths.stage_outputs(stage)
         except ValueError:
+            continue
+
+        if not outputs:
             continue
 
         log.info("  [%s]", stage)
