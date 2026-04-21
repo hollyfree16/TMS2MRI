@@ -93,8 +93,9 @@ Examples
     viz = p.add_argument_group("visualization")
     viz.add_argument("--id", action="append", dest="ids", default=None,
                      metavar="ID",
-                     help="Row ID(s) to visualize. Repeat for multiple: "
-                          "--id 1.26.23 --id 1.48.18.  Use --id all for everything.")
+                     help="Row ID(s) to visualize and include in filtered CSVs. "
+                          "Repeat for multiple: --id 1.26.23 --id 1.48.18. "
+                          "Use --id all for everything.")
     viz.add_argument("--coord-col", default="ef", choices=["ef", "coil"],
                      help="Coordinate set to plot: ef (default) or coil")
     viz.add_argument("--color-by-hemi", action="store_true",
@@ -103,9 +104,9 @@ Examples
                      help="Marker size for glass brain plot (default: 5)")
 
     # ------------------------------------------------------------------ #
-    # Surface snapping (stage 06)
+    # Surface snapping (stage 04)
     # ------------------------------------------------------------------ #
-    snap = p.add_argument_group("surface snapping (stage 06)")
+    snap = p.add_argument_group("surface snapping")
     snap.add_argument(
         "--fsaverage-mesh",
         default="fsaverage",
@@ -117,7 +118,7 @@ Examples
     )
     snap.add_argument(
         "--skip-snap", action="store_true",
-        help="Skip stage 06 (surface snapping) even when MNI registration "
+        help="Skip fsaverage surface snapping even when MNI registration "
              "is available.",
     )
 
@@ -167,6 +168,9 @@ Examples
     # Map log-level string to int
     args.log_level_int = getattr(logging, args.log_level)
 
+    # Determine whether IDs were provided (drives filtered CSV generation)
+    has_ids = args.ids is not None
+
     # Build path manifest
     paths = PathManifest.build(
         output_dir        = args.output_dir,
@@ -176,6 +180,7 @@ Examples
         mni_template      = args.mni_template,
         mni_template_full = args.mni_template_full,
         shared_csv        = args.shared_csv,
+        has_ids           = has_ids,
     )
 
     return args, paths

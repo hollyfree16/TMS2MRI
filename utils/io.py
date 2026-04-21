@@ -59,16 +59,20 @@ class PathManifest:
     inv_warp:         Path
     t1_in_mni:        Path | None   # only if mni_template_full provided
 
-    # 04_convert_coords
-    targets_native:   Path
-    targets_mni:      Path | None   # only if mni registration enabled
+    # 04_convert_coords  (full — all rows)
+    targets_native:       Path
+    targets_mni:          Path | None   # only if mni registration enabled
+    targets_fsaverage:    Path | None   # only if mni registration enabled
+
+    # 04_convert_coords  (filtered — only --id rows, written when ids provided)
+    targets_native_filtered:     Path | None
+    targets_mni_filtered:        Path | None
+    targets_fsaverage_filtered:  Path | None
 
     # 05_visualize
     html_out:         Path
     png_out:          Path
-
-    # 06_snap_surface
-    targets_fsaverage: Path | None  # only if mni registration enabled
+    ho_regions_png:   Path          # subject-level HO atlas plot
 
     # --- Shared CSV (optional, cross-subject) ---
     shared_csv:       Path | None   = None
@@ -83,10 +87,16 @@ class PathManifest:
         mni_template:      Path | None,
         mni_template_full: Path | None,
         shared_csv:        Path | None = None,
+        has_ids:           bool = False,
     ) -> "PathManifest":
         """
         Construct a fully-populated PathManifest from the top-level arguments.
         All paths derived deterministically — no path construction elsewhere.
+
+        Parameters
+        ----------
+        has_ids : True when --id flags were passed. Controls whether filtered
+                  CSV paths are populated (non-None).
         """
         sub    = output_dir / subject_id
         xnbe   = sub / "xnbe"
@@ -95,6 +105,18 @@ class PathManifest:
         viz    = sub / "visualization"
         logs   = sub / "logs"
         reg_px = reg / "sub_to_MNI_"   # ANTs prefix
+
+        # Filtered paths only exist when IDs were requested
+        def _filtered(path: Path | None) -> Path | None:
+            if path is None or not has_ids:
+                return None
+            stem = path.stem.replace(".nii", "")   # handle .nii.gz
+            suffix = "".join(path.suffixes)
+            return path.parent / f"{stem}_filtered{suffix}"
+
+        targets_native    = coords / "targets_native.csv"
+        targets_mni       = (coords / "targets_mni.csv")       if mni_template else None
+        targets_fsaverage = (coords / "targets_fsaverage.csv") if mni_template else None
 
         return cls(
             # inputs
@@ -125,16 +147,20 @@ class PathManifest:
             inv_warp          = Path(str(reg_px) + "1InverseWarp.nii.gz"),
             t1_in_mni         = (reg / "T1_in_MNI.nii.gz") if mni_template_full else None,
 
-            # 04
-            targets_native    = coords / "targets_native.csv",
-            targets_mni       = (coords / "targets_mni.csv") if mni_template else None,
+            # 04 full
+            targets_native    = targets_native,
+            targets_mni       = targets_mni,
+            targets_fsaverage = targets_fsaverage,
+
+            # 04 filtered
+            targets_native_filtered    = _filtered(targets_native),
+            targets_mni_filtered       = _filtered(targets_mni),
+            targets_fsaverage_filtered = _filtered(targets_fsaverage),
 
             # 05
             html_out          = viz / "stimulation_sites.html",
             png_out           = viz / "stimulation_sites.png",
-
-            # 06
-            targets_fsaverage = (coords / "targets_fsaverage.csv") if mni_template else None,
+            ho_regions_png    = viz / "ho_regions.png",
 
             # optional
             shared_csv        = shared_csv,
@@ -142,9 +168,8 @@ class PathManifest:
 
     def required_dirs(self) -> list[Path]:
         """All directories that must exist before the pipeline runs."""
-        dirs = [self.xnbe_dir, self.reg_dir, self.coords_dir,
+        return [self.xnbe_dir, self.reg_dir, self.coords_dir,
                 self.viz_dir,  self.log_dir]
-        return dirs
 
     def stage_outputs(self, stage: str) -> list[Path]:
         """
@@ -156,24 +181,41 @@ class PathManifest:
         """
         if stage == "parse":
             return [self.landmarks_csv, self.targets_csv]
+
         if stage == "skullstrip":
             return [self.t1_brain]
+
         if stage == "register":
             outs = [self.affine_mat, self.warp, self.inv_warp]
             if self.t1_in_mni:
                 outs.append(self.t1_in_mni)
             return outs
+
         if stage == "convert":
             outs = [self.targets_native]
             if self.targets_mni:
                 outs.append(self.targets_mni)
-            return outs
-        if stage == "visualize":
-            return [self.html_out, self.png_out]
-        if stage == "snap":
             if self.targets_fsaverage:
-                return [self.targets_fsaverage]
+                outs.append(self.targets_fsaverage)
+            # Filtered outputs — only checked if paths are set
+            for p in [self.targets_native_filtered,
+                      self.targets_mni_filtered,
+                      self.targets_fsaverage_filtered]:
+                if p is not None:
+                    outs.append(p)
+            return outs
+
+        if stage == "visualize":
+            outs = [self.html_out, self.png_out]
+            # ho_regions_png is produced when MNI coords are available
+            if self.targets_mni is not None:
+                outs.append(self.ho_regions_png)
+            return outs
+
+        if stage == "snap":
+            # Stage 06 is now a stub — no mandatory outputs yet
             return []
+
         raise ValueError(f"Unknown stage: {stage!r}")
 
 

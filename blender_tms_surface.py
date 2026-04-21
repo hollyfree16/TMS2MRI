@@ -4,41 +4,43 @@ blender_tms_surface.py
 Standalone Blender script: load fsaverage pial surfaces and plot TMS
 stimulation coordinates as spheres on the surface, coloured by hemisphere.
 
+Filtering is handled upstream by run_tms2mni.py (--id flags), which writes
+targets_fsaverage_filtered.csv. Pass that file here — no --id flag needed.
+
 Run from the command line:
     blender --background --python blender_tms_surface.py -- \\
-        --fsaverage-csv path/to/targets_fsaverage.csv \\
+        --fsaverage-csv path/to/targets_fsaverage_filtered.csv \\
         --output-dir ./viz
 
     # Multiple subjects / group:
     blender --background --python blender_tms_surface.py -- \\
-        --fsaverage-csv sub01/targets_fsaverage.csv \\
-        --fsaverage-csv sub02/targets_fsaverage.csv \\
+        --fsaverage-csv sub01/coordinates/targets_fsaverage_filtered.csv \\
+        --fsaverage-csv sub02/coordinates/targets_fsaverage_filtered.csv \\
         --output-dir ./group_viz \\
         --output-prefix group_M1
 
-    # Save .blend for interactive exploration (no render):
+    # Use full (unfiltered) CSV explicitly:
     blender --background --python blender_tms_surface.py -- \\
         --fsaverage-csv targets_fsaverage.csv \\
+        --output-dir ./viz
+
+    # Save .blend for interactive exploration (no render):
+    blender --background --python blender_tms_surface.py -- \\
+        --fsaverage-csv targets_fsaverage_filtered.csv \\
         --output-dir ./viz \\
         --blend-only
 
-    # Open interactively (Blender GUI):
-    blender --python blender_tms_surface.py -- \\
-        --fsaverage-csv targets_fsaverage.csv \\
-        --output-dir ./viz \\
-        --no-render
-
 Requirements
 ------------
-- Blender >= 3.0  (tested on 3.6 and 4.x)
+- Blender >= 3.0  (tested on 4.x and 5.x)
 - nilearn must be importable from Blender's Python environment, OR
   pass --nilearn-python /path/to/python to use your system Python to
   export the surface meshes first (see --help).
 
 Outputs
 -------
-  <output-prefix>_surface.blend   — Blender file (open to explore interactively)
-  <output-prefix>_surface.png     — rendered PNG (unless --blend-only / --no-render)
+  <output-prefix>_surface.blend   — open in Blender GUI to explore
+  <output-prefix>_surface.png     — rendered PNG (unless --blend-only)
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ import os
 import sys
 import subprocess
 import tempfile
+
 
 # ============================================================
 # Parse args  (Blender passes everything after "--" to the script)
@@ -69,7 +72,8 @@ def _parse_args() -> argparse.Namespace:
         dest="fsaverage_csvs",
         required=True,
         metavar="PATH",
-        help="Path to a targets_fsaverage.csv (from stage 06). Repeat for multiple subjects.",
+        help="Path to a targets_fsaverage_filtered.csv (or targets_fsaverage.csv). "
+             "Repeat for multiple subjects.",
     )
     p.add_argument(
         "--output-dir",
@@ -86,15 +90,14 @@ def _parse_args() -> argparse.Namespace:
         default="fsaverage",
         choices=["fsaverage", "fsaverage5", "fsaverage6"],
         help="fsaverage mesh resolution (default: fsaverage). "
-             "Must match the mesh used in stage 06.",
+             "Must match the mesh used in run_tms2mni.py.",
     )
     p.add_argument(
         "--nilearn-python",
         default=None,
         metavar="PATH",
-        help="Path to a Python interpreter that has nilearn installed, "
-             "if Blender's bundled Python does not. "
-             "Used to export surface meshes to /tmp before importing.",
+        help="Path to a Python interpreter with nilearn installed, "
+             "if Blender's bundled Python does not have it.",
     )
     p.add_argument(
         "--sphere-radius",
@@ -147,13 +150,11 @@ fs = datasets.fetch_surf_fsaverage(mesh)
 
 def load_mesh(path):
     path = str(path)
-    # Try nibabel FreeSurfer format first
     try:
         coords, faces = nib.freesurfer.read_geometry(path)
         return coords, faces
     except Exception:
         pass
-    # Try GIFTI
     try:
         img = nib.load(path)
         arrays = img.darrays
@@ -162,7 +163,6 @@ def load_mesh(path):
         return coords, faces
     except Exception:
         pass
-    # Try nilearn as last resort
     try:
         from nilearn import surface as surf
         coords, faces = surf.load_surf_mesh(path)
@@ -185,9 +185,8 @@ print('exported', out)
 
 
 def _export_surfaces_via_subprocess(python_bin: str, mesh: str) -> dict:
-    """Use an external Python to export fsaverage meshes to a temp JSON."""
     import json
-    tmp = tempfile.mktemp(suffix=".json")
+    tmp    = tempfile.mktemp(suffix=".json")
     script = tempfile.mktemp(suffix=".py")
     with open(script, "w") as f:
         f.write(EXPORT_SCRIPT)
@@ -207,9 +206,8 @@ def _export_surfaces_via_subprocess(python_bin: str, mesh: str) -> dict:
 
 
 def _load_surfaces_direct(mesh: str) -> dict:
-    """Load fsaverage meshes directly (nilearn available in Blender Python)."""
     from nilearn import datasets, surface as surf
-    fs = datasets.fetch_surf_fsaverage(mesh)
+    fs     = datasets.fetch_surf_fsaverage(mesh)
     result = {}
     for key in ['pial_left', 'pial_right']:
         coords, faces = surf.load_surf_mesh(fs[key])
@@ -226,8 +224,7 @@ def _get_surfaces(args: argparse.Namespace) -> dict:
     except ImportError:
         print(
             "[blender_tms] ERROR: nilearn not found in Blender's Python.\n"
-            "  Option 1: pip install nilearn into Blender's Python:\n"
-            "    <blender>/python/bin/pip install nilearn\n"
+            "  Option 1: pip install nilearn into Blender's Python\n"
             "  Option 2: pass --nilearn-python /path/to/your/python"
         )
         sys.exit(1)
@@ -239,8 +236,9 @@ def _get_surfaces(args: argparse.Namespace) -> dict:
 
 def _load_coords(csv_paths: list[str]) -> list[dict]:
     """
-    Read fs_x/fs_y/fs_z + hemisphere from one or more targets_fsaverage.csv files.
-    Returns list of dicts with keys: x, y, z, hemi
+    Read fs_x/fs_y/fs_z from one or more fsaverage CSV files.
+    Hemisphere derived from sign of fs_x (negative = L) — always correct
+    in fsaverage RAS space.
     """
     points = []
     for path in csv_paths:
@@ -254,13 +252,19 @@ def _load_coords(csv_paths: list[str]) -> list[dict]:
                     z = float(row["fs_z"])
                 except (KeyError, ValueError):
                     continue
-                # hemisphere: use ef_hemisphere if present, else derive from fs_surface
-                hemi = row.get("ef_hemisphere", "")
-                if not hemi:
-                    surf_name = row.get("fs_surface", "")
-                    hemi = "L" if "left" in surf_name else "R"
-                points.append({"x": x, "y": y, "z": z, "hemi": hemi.strip()})
-    print(f"[blender_tms] Loaded {len(points)} stimulation points from {len(csv_paths)} CSV(s)")
+
+                hemi = "L" if x < 0 else "R"
+                points.append({
+                    "x": x, "y": y, "z": z,
+                    "hemi": hemi,
+                    "id": str(row.get("id", "")).strip().rstrip("."),
+                })
+
+    print(f"[blender_tms] Loaded {len(points)} stimulation points "
+          f"from {len(csv_paths)} CSV(s)")
+    if not points:
+        print("[blender_tms] WARNING: No valid points found. "
+              "Check that fs_x/fs_y/fs_z columns are present and non-NaN.")
     return points
 
 
@@ -277,62 +281,57 @@ def _build_scene(surfaces: dict, points: list[dict], args: argparse.Namespace) -
     import bpy
     import mathutils
 
-    brain_color  = _parse_color(args.brain_color)
-    color_left   = _parse_color(args.color_left)
-    color_right  = _parse_color(args.color_right)
+    brain_color = _parse_color(args.brain_color)
+    color_left  = _parse_color(args.color_left)
+    color_right = _parse_color(args.color_right)
 
     # ---- Clear scene ----
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
-    scene.render.engine = "CYCLES"
-    scene.cycles.samples = 128
-    scene.render.resolution_x = 2400
-    scene.render.resolution_y = 1200
+    scene.render.engine           = "CYCLES"
+    scene.cycles.samples          = 128
+    scene.render.resolution_x     = 2400
+    scene.render.resolution_y     = 1200
     scene.render.film_transparent = False
+
     scene.world = bpy.data.worlds.new("World")
     scene.world.use_nodes = True
     bg = scene.world.node_tree.nodes["Background"]
-    bg.inputs[0].default_value = (0.05, 0.05, 0.05, 1.0)   # dark background
+    bg.inputs[0].default_value = (0.05, 0.05, 0.05, 1.0)
     bg.inputs[1].default_value = 1.0
 
     # ---- Brain material ----
     brain_mat = bpy.data.materials.new("Brain")
     brain_mat.use_nodes = True
     bsdf = brain_mat.node_tree.nodes["Principled BSDF"]
-    bsdf.inputs["Base Color"].default_value  = (*brain_color, 1.0)
-    bsdf.inputs["Roughness"].default_value   = 0.85
+    bsdf.inputs["Base Color"].default_value        = (*brain_color, 1.0)
+    bsdf.inputs["Roughness"].default_value         = 0.85
     bsdf.inputs["Specular IOR Level"].default_value = 0.05
-    brain_mat.diffuse_color = (*brain_color, 0.9)
 
     # ---- Point materials ----
     def _make_mat(name, color, emit=0.4):
-        mat = bpy.data.materials.new(name)
+        mat  = bpy.data.materials.new(name)
         mat.use_nodes = True
         bsdf = mat.node_tree.nodes["Principled BSDF"]
-        bsdf.inputs["Base Color"].default_value  = (*color, 1.0)
+        bsdf.inputs["Base Color"].default_value     = (*color, 1.0)
         bsdf.inputs["Emission Color"].default_value = (*color, 1.0)
         bsdf.inputs["Emission Strength"].default_value = emit
-        bsdf.inputs["Roughness"].default_value = 0.2
+        bsdf.inputs["Roughness"].default_value      = 0.2
         return mat
 
     mat_left  = _make_mat("Left",    color_left)
     mat_right = _make_mat("Right",   color_right)
-    mat_mid   = _make_mat("Midline", (0.9, 0.9, 0.2))   # yellow for near-midline
+    mat_mid   = _make_mat("Midline", (0.9, 0.9, 0.2))
 
     # ---- Import brain meshes ----
     for hemi_key, obj_name in [("pial_left", "Brain_LH"), ("pial_right", "Brain_RH")]:
         if hemi_key not in surfaces:
             continue
-        data   = surfaces[hemi_key]
-        coords = data["coords"]
-        faces  = data["faces"]
+        data     = surfaces[hemi_key]
+        verts    = [(c[0], c[1], c[2]) for c in data["coords"]]
+        bl_faces = [tuple(f) for f in data["faces"]]
 
         mesh = bpy.data.meshes.new(obj_name)
-        verts = [(c[0], c[1], c[2]) for c in coords]
-
-        # Blender needs faces as tuples
-        bl_faces = [tuple(f) for f in faces]
-
         mesh.from_pydata(verts, [], bl_faces)
         mesh.update()
 
@@ -340,22 +339,20 @@ def _build_scene(surfaces: dict, points: list[dict], args: argparse.Namespace) -
         scene.collection.objects.link(obj)
         obj.data.materials.append(brain_mat)
 
-        # Smooth shading
         for poly in obj.data.polygons:
             poly.use_smooth = True
 
-        # Add edge split modifier for cleaner look
         mod = obj.modifiers.new("EdgeSplit", "EDGE_SPLIT")
         mod.split_angle = 0.5
 
-        print(f"[blender_tms] Imported {obj_name}: {len(verts)} verts, {len(bl_faces)} faces")
+        print(f"[blender_tms] Imported {obj_name}: "
+              f"{len(verts)} verts, {len(bl_faces)} faces")
 
-    # ---- Add stimulation point spheres ----
-    # Use instancing for speed: one base sphere per colour, then instance
+    # ---- Stimulation point spheres ----
     def _base_sphere(name, mat, radius):
         bpy.ops.mesh.primitive_uv_sphere_add(
             radius=radius, segments=16, ring_count=12,
-            location=(0, 0, -9999)   # hidden off-screen
+            location=(0, 0, -9999),
         )
         obj = bpy.context.active_object
         obj.name = name
@@ -379,38 +376,37 @@ def _build_scene(surfaces: dict, points: list[dict], args: argparse.Namespace) -
         else:
             src = sphere_m; n_mid += 1
 
-        # Duplicate linked (shares mesh data — memory efficient for many points)
-        dup = src.copy()
-        dup.data = src.data   # shared mesh
+        dup          = src.copy()
+        dup.data     = src.data
         dup.location = mathutils.Vector((x, y, z))
-        dup.name = f"stim_{i:04d}_{hemi}"
+        dup.name     = f"stim_{i:04d}_{hemi}"
         scene.collection.objects.link(dup)
 
-    print(f"[blender_tms] Placed {n_left} L points, {n_right} R points, {n_mid} midline points")
+    print(f"[blender_tms] Placed {n_left} L (blue), "
+          f"{n_right} R (red), {n_mid} midline (yellow) points")
 
     # ---- Camera ----
-    # Position for a good superior-lateral view of the whole brain
-    cam_data = bpy.data.cameras.new("Camera")
+    cam_data      = bpy.data.cameras.new("Camera")
     cam_data.lens = 50
-    cam_obj  = bpy.data.objects.new("Camera", cam_data)
-    cam_obj.location = mathutils.Vector((180, -220, 160))
+    cam_obj       = bpy.data.objects.new("Camera", cam_data)
+    cam_obj.location       = mathutils.Vector((180, -220, 160))
     cam_obj.rotation_euler = mathutils.Euler((1.1, 0.0, 0.65), "XYZ")
     scene.collection.objects.link(cam_obj)
     scene.camera = cam_obj
 
     # ---- Key light ----
-    sun_data = bpy.data.lights.new("Sun", type="SUN")
+    sun_data        = bpy.data.lights.new("Sun", type="SUN")
     sun_data.energy = 3.0
-    sun_obj = bpy.data.objects.new("Sun", sun_data)
-    sun_obj.location = mathutils.Vector((100, -100, 200))
+    sun_obj         = bpy.data.objects.new("Sun", sun_data)
+    sun_obj.location       = mathutils.Vector((100, -100, 200))
     sun_obj.rotation_euler = mathutils.Euler((0.7, 0.0, 0.8), "XYZ")
     scene.collection.objects.link(sun_obj)
 
     # ---- Fill light ----
-    fill_data = bpy.data.lights.new("Fill", type="AREA")
+    fill_data       = bpy.data.lights.new("Fill", type="AREA")
     fill_data.energy = 500
     fill_data.size   = 200
-    fill_obj = bpy.data.objects.new("Fill", fill_data)
+    fill_obj         = bpy.data.objects.new("Fill", fill_data)
     fill_obj.location = mathutils.Vector((-150, 100, 80))
     scene.collection.objects.link(fill_obj)
 
@@ -420,7 +416,7 @@ def _build_scene(surfaces: dict, points: list[dict], args: argparse.Namespace) -
 # ============================================================
 
 def main() -> None:
-    args = parse_result = _parse_args()
+    args = _parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     blend_path  = os.path.join(args.output_dir, f"{args.output_prefix}_surface.blend")
@@ -429,30 +425,29 @@ def main() -> None:
     print(f"[blender_tms] Loading surfaces (mesh={args.fsaverage_mesh})...")
     surfaces = _get_surfaces(args)
 
-    print(f"[blender_tms] Loading stimulation coordinates...")
+    print("[blender_tms] Loading stimulation coordinates...")
     points = _load_coords(args.fsaverage_csvs)
 
     if not points:
-        print("[blender_tms] ERROR: No valid stimulation points found. Check your CSV(s).")
+        print("[blender_tms] ERROR: No valid stimulation points. "
+              "Check your CSV path(s).")
         sys.exit(1)
 
-    print(f"[blender_tms] Building Blender scene...")
+    print("[blender_tms] Building Blender scene...")
     _build_scene(surfaces, points, args)
 
     import bpy
 
-    # Save .blend
     bpy.ops.wm.save_as_mainfile(filepath=blend_path)
-    print(f"[blender_tms] Saved .blend: {blend_path}")
-    print(f"[blender_tms] Open in Blender GUI to explore interactively.")
+    print(f"[blender_tms] Saved .blend : {blend_path}")
+    print("[blender_tms] Open in Blender GUI to explore interactively.")
 
-    # Render PNG
     if not args.blend_only and not args.no_render:
         bpy.context.scene.render.filepath = render_path
         bpy.ops.render.render(write_still=True)
-        print(f"[blender_tms] Rendered PNG: {render_path}")
+        print(f"[blender_tms] Rendered PNG : {render_path}")
     else:
-        print(f"[blender_tms] Skipping render (--blend-only or --no-render set).")
+        print("[blender_tms] Skipping render (--blend-only or --no-render).")
 
     print("[blender_tms] Done.")
 

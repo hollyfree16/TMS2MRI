@@ -7,9 +7,10 @@ Chains:
   01  parse_nbe       — .nbe → landmarks.csv + targets.csv
   02  skullstrip      — T1 → T1_brain  (SynthStrip, BET fallback)
   03  register_mni    — T1_brain → MNI152  (ANTs SyN)
-  04  convert_coords  — NBE → native voxels/mm → MNI mm
-  05  visualize       — nilearn glass brain + shared CSV
-  06  snap_surface    — MNI mm → nearest fsaverage pial vertex
+  04  convert_coords  — NBE → native/MNI mm + fsaverage snap
+                        writes full CSVs + filtered CSVs (when --id used)
+  05  visualize       — glass brain + HO atlas plot + shared CSV
+  06  snap_surface    — stub (reserved for future Blender integration)
 
 Usage
 -----
@@ -21,7 +22,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Make sure package-relative imports work when running as a script
 sys.path.insert(0, str(Path(__file__).parent))
 
 import logging
@@ -43,9 +43,6 @@ from stages import (
 def main() -> None:
     args, paths = parse_args()
 
-    # ------------------------------------------------------------------ #
-    # Create output directories + configure logging
-    # ------------------------------------------------------------------ #
     make_dirs(paths)
 
     configure_logging(
@@ -64,13 +61,12 @@ def main() -> None:
         log.info("MNI template (brain) : %s", paths.mni_template)
     if paths.mni_template_full:
         log.info("MNI template (full)  : %s", paths.mni_template_full)
+    if args.ids:
+        log.info("IDs requested : %s", args.ids)
 
     do_mni = paths.mni_template is not None
     force  = args.force
 
-    # ------------------------------------------------------------------ #
-    # Run stages
-    # ------------------------------------------------------------------ #
     run_stage("parse",     s01.run, args, paths, force=force)
 
     run_stage("skullstrip", s02.run, args, paths,
@@ -87,13 +83,9 @@ def main() -> None:
               enabled = (args.ids is not None) and not args.skip_viz,
               force   = force)
 
-    run_stage("snap",      s06.run, args, paths,
-              enabled = do_mni and not args.skip_snap,
-              force   = force)
+    # Stage 06 is a stub — disabled by default until Blender integration lands
+    # run_stage("snap", s06.run, args, paths, enabled=False, force=force)
 
-    # ------------------------------------------------------------------ #
-    # Final report
-    # ------------------------------------------------------------------ #
     report(paths, args.subject_id)
 
 

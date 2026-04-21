@@ -1,12 +1,14 @@
 """
-stages/05_visualize.py
-======================
-Stage 05: Plot selected stimulation sites on a nilearn glass brain and
-optionally append MNI coordinates to a shared cross-subject CSV.
+stages/stage_05_visualize.py
+=============================
+Stage 05: Plot selected stimulation sites on a nilearn glass brain,
+generate a Harvard-Oxford atlas overlay, and optionally append MNI
+coordinates to a shared cross-subject CSV.
 
-Outputs:
+Outputs (all filtered to --id rows):
   stimulation_sites.html  — interactive 3D glass brain
   stimulation_sites.png   — static 4-panel (L/coronal/axial/R)
+  ho_regions.png          — glass brain with HO atlas contours (MNI only)
 """
 
 from __future__ import annotations
@@ -28,21 +30,39 @@ def run(args, paths: PathManifest) -> None:
         log.info("No --id flags provided — skipping visualization.")
         return
 
-    # Select coordinate CSV
-    if paths.targets_mni and paths.targets_mni.exists():
+    # ------------------------------------------------------------------ #
+    # Select coordinate source
+    # ------------------------------------------------------------------ #
+    # Prefer filtered MNI CSV if it exists, fall back to filtered native,
+    # then full CSVs as last resort.
+    if paths.targets_mni_filtered and paths.targets_mni_filtered.exists():
+        csv_path  = paths.targets_mni_filtered
+        mm_x_col  = "ef_mni_mm_x" if args.coord_col == "ef" else "coil_mni_mm_x"
+        mm_y_col  = "ef_mni_mm_y" if args.coord_col == "ef" else "coil_mni_mm_y"
+        mm_z_col  = "ef_mni_mm_z" if args.coord_col == "ef" else "coil_mni_mm_z"
+        space     = "MNI (filtered)"
+        is_mni    = True
+    elif paths.targets_mni and paths.targets_mni.exists():
         csv_path  = paths.targets_mni
         mm_x_col  = "ef_mni_mm_x" if args.coord_col == "ef" else "coil_mni_mm_x"
         mm_y_col  = "ef_mni_mm_y" if args.coord_col == "ef" else "coil_mni_mm_y"
         mm_z_col  = "ef_mni_mm_z" if args.coord_col == "ef" else "coil_mni_mm_z"
-        hemi_col  = "ef_hemisphere"
         space     = "MNI"
+        is_mni    = True
+    elif paths.targets_native_filtered and paths.targets_native_filtered.exists():
+        csv_path  = paths.targets_native_filtered
+        mm_x_col  = "ef_native_mm_x" if args.coord_col == "ef" else "coil_native_mm_x"
+        mm_y_col  = "ef_native_mm_y" if args.coord_col == "ef" else "coil_native_mm_y"
+        mm_z_col  = "ef_native_mm_z" if args.coord_col == "ef" else "coil_native_mm_z"
+        space     = "native (filtered)"
+        is_mni    = False
     else:
         csv_path  = paths.targets_native
         mm_x_col  = "ef_native_mm_x" if args.coord_col == "ef" else "coil_native_mm_x"
         mm_y_col  = "ef_native_mm_y" if args.coord_col == "ef" else "coil_native_mm_y"
         mm_z_col  = "ef_native_mm_z" if args.coord_col == "ef" else "coil_native_mm_z"
-        hemi_col  = "ef_hemisphere"
         space     = "native"
+        is_mni    = False
 
     log.info("Coordinate CSV : %s  (%s space)", csv_path, space)
 
@@ -60,26 +80,34 @@ def run(args, paths: PathManifest) -> None:
     else:
         id_norm  = [_norm(x) for x in args.ids]
         selected = df[df["_id_norm"].isin(id_norm)].dropna(
-                        subset=[mm_x_col, mm_y_col, mm_z_col])
+                       subset=[mm_x_col, mm_y_col, mm_z_col])
         missing  = [i for i in id_norm if i not in df["_id_norm"].values]
         if missing:
             log.warning("IDs not found in CSV: %s", missing)
-        log.info("Selected %d points from %d requested IDs", len(selected), len(args.ids))
+        log.info("Selected %d points from %d requested IDs",
+                 len(selected), len(args.ids))
 
     if selected.empty:
         log.error("No valid coordinates to plot after filtering NaNs.")
         raise RuntimeError("No coordinates to plot.")
 
-    n_left  = (selected[hemi_col] == "L").sum()
-    n_right = (selected[hemi_col] == "R").sum()
+    coords = selected[[mm_x_col, mm_y_col, mm_z_col]].values
+
+    # Hemisphere — derived from MNI X sign when available, else from column
+    if is_mni:
+        hemi_labels = ["L" if x < 0 else "R" for x in coords[:, 0]]
+    else:
+        hemi_col    = "ef_hemisphere"
+        hemi_labels = list(selected[hemi_col])
+
+    n_left  = hemi_labels.count("L")
+    n_right = hemi_labels.count("R")
     log.info("Left  hemisphere: %d points", n_left)
     log.info("Right hemisphere: %d points", n_right)
 
-    coords = selected[[mm_x_col, mm_y_col, mm_z_col]].values
-
     # Colours
     if args.color_by_hemi:
-        colors = ["#4488FF" if h == "L" else "#FF4444" for h in selected[hemi_col]]
+        colors = ["#4488FF" if h == "L" else "#FF4444" for h in hemi_labels]
         log.info("Colour mode: by hemisphere  L=#4488FF  R=#FF4444")
     else:
         colors = "#FF4444"
@@ -87,15 +115,15 @@ def run(args, paths: PathManifest) -> None:
 
     paths.viz_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------ #
-    # Interactive HTML
-    # ------------------------------------------------------------------ #
     from nilearn import plotting
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
 
+    # ------------------------------------------------------------------ #
+    # Interactive HTML
+    # ------------------------------------------------------------------ #
     log.info("Building interactive glass brain...")
     view = plotting.view_markers(
         coords,
@@ -108,20 +136,18 @@ def run(args, paths: PathManifest) -> None:
     # ------------------------------------------------------------------ #
     # Static 4-panel PNG
     # ------------------------------------------------------------------ #
-    log.info("Building static 4-panel glass brain...")
+    log.info("Building static glass brain PNG...")
     fig = plt.figure(figsize=(14, 4), facecolor="white")
     disp = plotting.plot_glass_brain(
-        None,
-        display_mode="lyrz",
-        figure=fig,
-        title=None,
-        annotate=True,
-        black_bg=False,
+        None, display_mode="lyrz", figure=fig,
+        title=None, annotate=True, black_bg=False,
     )
 
+    hemi_arr  = np.array(hemi_labels)
+    left_pts  = coords[hemi_arr == "L"]
+    right_pts = coords[hemi_arr == "R"]
+
     if args.color_by_hemi:
-        left_pts  = coords[np.array(selected[hemi_col] == "L")]
-        right_pts = coords[np.array(selected[hemi_col] == "R")]
         if len(left_pts):
             disp.add_markers(left_pts,  marker_color="#4488FF",
                              marker_size=args.marker_size * 3)
@@ -143,34 +169,59 @@ def run(args, paths: PathManifest) -> None:
     log.info("PNG  saved : %s", paths.png_out)
 
     # ------------------------------------------------------------------ #
+    # Harvard-Oxford atlas plot (MNI only)
+    # ------------------------------------------------------------------ #
+    if is_mni:
+        log.info("Building Harvard-Oxford atlas overlay...")
+        try:
+            from utils.atlas import plot_ho_regions
+            plot_ho_regions(
+                coords_mm   = coords,
+                hemi_labels = hemi_labels,
+                out_path    = str(paths.ho_regions_png),
+                color_left  = "#4488FF",
+                color_right = "#FF4444",
+                marker_size = args.marker_size,
+                title       = None,
+            )
+            log.info("HO regions : %s", paths.ho_regions_png)
+        except Exception as exc:
+            log.warning("HO atlas plot failed (non-fatal): %s", exc)
+    else:
+        log.info("Skipping HO atlas plot (native space coordinates — no MNI).")
+
+    # ------------------------------------------------------------------ #
     # Shared CSV append
     # ------------------------------------------------------------------ #
     if paths.shared_csv is not None:
         if args.subject_id is None or args.site is None:
             log.warning("--shared-csv requires --subject-id and --site — skipping.")
+        elif not is_mni:
+            log.warning("--shared-csv requires MNI coordinates — skipping (native space).")
         else:
             _append_shared_csv(selected, mm_x_col, mm_y_col, mm_z_col,
-                               hemi_col, args, paths)
+                               hemi_labels, args, paths)
 
 
 def _append_shared_csv(
     selected,
     mm_x_col, mm_y_col, mm_z_col,
-    hemi_col,
+    hemi_labels: list[str],
     args,
     paths: PathManifest,
 ) -> None:
     rows = []
-    for _, row in selected.iterrows():
+    for i, (_, row) in enumerate(selected.iterrows()):
+        x = row[mm_x_col]
         rows.append({
             "subject_id":     args.subject_id,
             "site":           args.site,
             "id":             str(row["id"]).strip().rstrip("."),
-            "mni_mm_x":       round(row[mm_x_col], 2),
+            "mni_mm_x":       round(x, 2),
             "mni_mm_y":       round(row[mm_y_col], 2),
             "mni_mm_z":       round(row[mm_z_col], 2),
-            "hemisphere":     row[hemi_col],
-            "mni_hemisphere": "L" if row[mm_x_col] < 0 else "R",
+            "hemisphere":     row.get("ef_hemisphere", hemi_labels[i]),
+            "mni_hemisphere": "L" if x < 0 else "R",
         })
 
     new_df = pd.DataFrame(rows)
