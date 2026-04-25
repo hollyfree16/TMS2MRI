@@ -4,29 +4,24 @@ blender_tms_surface.py
 Standalone Blender script: load fsaverage pial surfaces and plot TMS
 stimulation coordinates as spheres on the surface, coloured by hemisphere.
 
-Filtering is handled upstream by run_tms2mni.py (--id flags), which writes
-targets_fsaverage_filtered.csv. Pass that file here — no --id flag needed.
+Pass a targets_fsaverage.csv produced by run_tms2mni.py. Use --id flags
+upstream to filter rows; the full CSV is used here directly.
 
 Run from the command line:
     blender --background --python blender_tms_surface.py -- \\
-        --fsaverage-csv path/to/targets_fsaverage_filtered.csv \\
+        --fsaverage-csv path/to/targets_fsaverage.csv \\
         --output-dir ./viz
 
     # Multiple subjects / group:
     blender --background --python blender_tms_surface.py -- \\
-        --fsaverage-csv sub01/coordinates/targets_fsaverage_filtered.csv \\
-        --fsaverage-csv sub02/coordinates/targets_fsaverage_filtered.csv \\
+        --fsaverage-csv sub01/coordinates/targets_fsaverage.csv \\
+        --fsaverage-csv sub02/coordinates/targets_fsaverage.csv \\
         --output-dir ./group_viz \\
         --output-prefix group_M1
 
-    # Use full (unfiltered) CSV explicitly:
-    blender --background --python blender_tms_surface.py -- \\
-        --fsaverage-csv targets_fsaverage.csv \\
-        --output-dir ./viz
-
     # Save .blend for interactive exploration (no render):
     blender --background --python blender_tms_surface.py -- \\
-        --fsaverage-csv targets_fsaverage_filtered.csv \\
+        --fsaverage-csv targets_fsaverage.csv \\
         --output-dir ./viz \\
         --blend-only
 
@@ -72,7 +67,7 @@ def _parse_args() -> argparse.Namespace:
         dest="fsaverage_csvs",
         required=True,
         metavar="PATH",
-        help="Path to a targets_fsaverage_filtered.csv (or targets_fsaverage.csv). "
+        help="Path to a targets_fsaverage.csv produced by run_tms2mni.py. "
              "Repeat for multiple subjects.",
     )
     p.add_argument(

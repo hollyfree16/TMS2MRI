@@ -5,7 +5,7 @@ Stage 05: Plot selected stimulation sites on a nilearn glass brain,
 generate a Harvard-Oxford atlas overlay, and optionally append MNI
 coordinates to a shared cross-subject CSV.
 
-Outputs (all filtered to --id rows):
+Outputs (plotted rows selected by --id):
   stimulation_sites.html  — interactive 3D glass brain
   stimulation_sites.png   — static 4-panel (L/coronal/axial/R)
   ho_regions.png          — glass brain with HO atlas contours (MNI only)
@@ -33,29 +33,13 @@ def run(args, paths: PathManifest) -> None:
     # ------------------------------------------------------------------ #
     # Select coordinate source
     # ------------------------------------------------------------------ #
-    # Prefer filtered MNI CSV if it exists, fall back to filtered native,
-    # then full CSVs as last resort.
-    if paths.targets_mni_filtered and paths.targets_mni_filtered.exists():
-        csv_path  = paths.targets_mni_filtered
-        mm_x_col  = "ef_mni_mm_x" if args.coord_col == "ef" else "coil_mni_mm_x"
-        mm_y_col  = "ef_mni_mm_y" if args.coord_col == "ef" else "coil_mni_mm_y"
-        mm_z_col  = "ef_mni_mm_z" if args.coord_col == "ef" else "coil_mni_mm_z"
-        space     = "MNI (filtered)"
-        is_mni    = True
-    elif paths.targets_mni and paths.targets_mni.exists():
+    if paths.targets_mni and paths.targets_mni.exists():
         csv_path  = paths.targets_mni
         mm_x_col  = "ef_mni_mm_x" if args.coord_col == "ef" else "coil_mni_mm_x"
         mm_y_col  = "ef_mni_mm_y" if args.coord_col == "ef" else "coil_mni_mm_y"
         mm_z_col  = "ef_mni_mm_z" if args.coord_col == "ef" else "coil_mni_mm_z"
         space     = "MNI"
         is_mni    = True
-    elif paths.targets_native_filtered and paths.targets_native_filtered.exists():
-        csv_path  = paths.targets_native_filtered
-        mm_x_col  = "ef_native_mm_x" if args.coord_col == "ef" else "coil_native_mm_x"
-        mm_y_col  = "ef_native_mm_y" if args.coord_col == "ef" else "coil_native_mm_y"
-        mm_z_col  = "ef_native_mm_z" if args.coord_col == "ef" else "coil_native_mm_z"
-        space     = "native (filtered)"
-        is_mni    = False
     else:
         csv_path  = paths.targets_native
         mm_x_col  = "ef_native_mm_x" if args.coord_col == "ef" else "coil_native_mm_x"

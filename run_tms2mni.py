@@ -8,7 +8,7 @@ Chains:
   02  skullstrip      — T1 → T1_brain  (SynthStrip, BET fallback)
   03  register_mni    — T1_brain → MNI152  (ANTs SyN)
   04  convert_coords  — NBE → native/MNI mm + fsaverage snap
-                        writes full CSVs + filtered CSVs (when --id used)
+                        writes full CSVs + summary CSV (when --id used)
   05  visualize       — glass brain + HO atlas plot + shared CSV
   06  snap_surface    — stub (reserved for future Blender integration)
 

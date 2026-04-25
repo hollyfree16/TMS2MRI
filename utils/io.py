@@ -64,10 +64,8 @@ class PathManifest:
     targets_mni:          Path | None   # only if mni registration enabled
     targets_fsaverage:    Path | None   # only if mni registration enabled
 
-    # 04_convert_coords  (filtered — only --id rows, written when ids provided)
-    targets_native_filtered:     Path | None
-    targets_mni_filtered:        Path | None
-    targets_fsaverage_filtered:  Path | None
+    # 04_convert_coords  (summary — filtered rows merged, written when ids provided)
+    targets_summary:  Path | None
 
     # 05_visualize
     html_out:         Path
@@ -105,14 +103,6 @@ class PathManifest:
         viz    = sub / "visualization"
         logs   = sub / "logs"
         reg_px = reg / "sub_to_MNI_"   # ANTs prefix
-
-        # Filtered paths only exist when IDs were requested
-        def _filtered(path: Path | None) -> Path | None:
-            if path is None or not has_ids:
-                return None
-            stem = path.stem.replace(".nii", "")   # handle .nii.gz
-            suffix = "".join(path.suffixes)
-            return path.parent / f"{stem}_filtered{suffix}"
 
         targets_native    = coords / "targets_native.csv"
         targets_mni       = (coords / "targets_mni.csv")       if mni_template else None
@@ -152,10 +142,8 @@ class PathManifest:
             targets_mni       = targets_mni,
             targets_fsaverage = targets_fsaverage,
 
-            # 04 filtered
-            targets_native_filtered    = _filtered(targets_native),
-            targets_mni_filtered       = _filtered(targets_mni),
-            targets_fsaverage_filtered = _filtered(targets_fsaverage),
+            # 04 summary
+            targets_summary            = (coords / "targets_summary.csv") if has_ids else None,
 
             # 05
             html_out          = viz / "stimulation_sites.html",
@@ -197,12 +185,8 @@ class PathManifest:
                 outs.append(self.targets_mni)
             if self.targets_fsaverage:
                 outs.append(self.targets_fsaverage)
-            # Filtered outputs — only checked if paths are set
-            for p in [self.targets_native_filtered,
-                      self.targets_mni_filtered,
-                      self.targets_fsaverage_filtered]:
-                if p is not None:
-                    outs.append(p)
+            if self.targets_summary is not None:
+                outs.append(self.targets_summary)
             return outs
 
         if stage == "visualize":

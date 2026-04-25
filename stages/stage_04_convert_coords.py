@@ -6,11 +6,9 @@ Stage 04: Convert NextStim NBE coordinates to:
   - MNI152 mm coordinates via ANTs point transform  (targets_mni.csv)
   - fsaverage pial surface snapped coordinates  (targets_fsaverage.csv)
 
-When --id flags are provided, also writes filtered versions of each CSV
-containing only the requested rows:
-  - targets_native_filtered.csv
-  - targets_mni_filtered.csv
-  - targets_fsaverage_filtered.csv
+When --id flags are provided, also writes a merged summary CSV containing
+only the requested rows with key columns from all three spaces:
+  - targets_summary.csv
 
 Automatic flip retry
 --------------------
@@ -45,6 +43,7 @@ import numpy as np
 import nibabel as nib
 import pandas as pd
 
+from utils.atlas import label_coords
 from utils.affine import (
     nextstim_to_mri_voxels,
     voxel_sizes_from_affine,
@@ -191,7 +190,7 @@ def run(args, paths: PathManifest) -> None:
     # ------------------------------------------------------------------ #
     if paths.targets_mni is None:
         log.info("No MNI template configured — skipping MNI + fsaverage transform.")
-        _write_filtered(native_df, None, None, args, paths)
+        _write_summary(native_df, None, None, args, paths)
         return
 
     if not paths.affine_mat.exists() or not paths.inv_warp.exists():
@@ -245,13 +244,13 @@ def run(args, paths: PathManifest) -> None:
         log.info("fsaverage snapping skipped (--skip-snap or no MNI template).")
 
     # ------------------------------------------------------------------ #
-    # Filtered CSVs
+    # Summary CSV
     # ------------------------------------------------------------------ #
-    _write_filtered(native_df, mni_df, fs_df, args, paths)
+    _write_summary(native_df, mni_df, fs_df, args, paths)
 
 
 # =============================================================================
-# Filtered CSV writer
+# Summary CSV writer
 # =============================================================================
 
 def _norm_id(s) -> str:
@@ -272,35 +271,67 @@ def _filter_df(df: pd.DataFrame, ids: list[str] | None) -> pd.DataFrame:
     return df[mask].copy()
 
 
-def _write_filtered(
+def _write_summary(
     native_df: pd.DataFrame,
     mni_df:    pd.DataFrame | None,
     fs_df:     pd.DataFrame | None,
     args,
     paths:     PathManifest,
 ) -> None:
-    """Write filtered CSV outputs when --id flags were provided."""
-    if args.ids is None:
+    """Merge filtered rows from native, MNI, and fsaverage into one summary CSV."""
+    if args.ids is None or paths.targets_summary is None:
         return
 
     filtered_native = _filter_df(native_df, args.ids)
-    log.info("Filtered native: %d rows", len(filtered_native))
+    if filtered_native.empty:
+        log.warning("Summary CSV: no rows matched the requested IDs — skipping.")
+        return
 
-    if paths.targets_native_filtered:
-        write_csv(filtered_native, paths.targets_native_filtered)
-        log.info("Native filtered CSV     : %s", paths.targets_native_filtered)
+    out = pd.DataFrame()
+    out["subject_id"] = [getattr(args, "subject_id", None)] * len(filtered_native)
+    out["site"]       = [getattr(args, "site",       None)] * len(filtered_native)
+    out["id"]         = filtered_native["id"].values
 
-    if mni_df is not None and paths.targets_mni_filtered:
-        filtered_mni = _filter_df(mni_df, args.ids)
-        log.info("Filtered MNI   : %d rows", len(filtered_mni))
-        write_csv(filtered_mni, paths.targets_mni_filtered)
-        log.info("MNI filtered CSV        : %s", paths.targets_mni_filtered)
+    for ax in ("x", "y", "z"):
+        out[f"ef_native_mm_{ax}"] = filtered_native[f"ef_native_mm_{ax}"].values
+    out["ef_hemisphere"] = filtered_native["ef_hemisphere"].values
 
-    if fs_df is not None and paths.targets_fsaverage_filtered:
-        filtered_fs = _filter_df(fs_df, args.ids)
-        log.info("Filtered fsaverage: %d rows", len(filtered_fs))
-        write_csv(filtered_fs, paths.targets_fsaverage_filtered)
-        log.info("fsaverage filtered CSV  : %s", paths.targets_fsaverage_filtered)
+    # MNI + fsaverage: prefer fs_df (has mni cols + snap cols); fall back to mni_df
+    mni_source = None
+    if fs_df is not None:
+        mni_source = _filter_df(fs_df, args.ids)
+    elif mni_df is not None:
+        mni_source = _filter_df(mni_df, args.ids)
+
+    if mni_source is not None and not mni_source.empty:
+        for ax in ("x", "y", "z"):
+            out[f"ef_mni_mm_{ax}"] = mni_source[f"ef_mni_mm_{ax}"].values
+
+        mni_x = mni_source["ef_mni_mm_x"].values
+        out["mni_hemisphere"] = [
+            ("L" if x < 0 else "R") if not np.isnan(float(x)) else None
+            for x in mni_x
+        ]
+
+        coords = mni_source[["ef_mni_mm_x", "ef_mni_mm_y", "ef_mni_mm_z"]].values
+        valid_mask = ~np.isnan(coords).any(axis=1)
+        labels: list = [None] * len(coords)
+        if valid_mask.any():
+            valid_labels = label_coords(coords[valid_mask])
+            j = 0
+            for i, v in enumerate(valid_mask):
+                if v:
+                    labels[i] = valid_labels[j]
+                    j += 1
+        out["ho_region"] = labels
+
+        if "snap_distance_mm" in mni_source.columns:
+            for ax in ("x", "y", "z"):
+                out[f"fs_{ax}"] = mni_source[f"fs_{ax}"].values
+            out["snap_distance_mm"] = mni_source["snap_distance_mm"].values
+
+    write_csv(out, paths.targets_summary)
+    log.info("Summary CSV    : %s  (%d rows)", paths.targets_summary, len(out))
 
 
 # =============================================================================

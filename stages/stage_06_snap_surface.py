@@ -22,5 +22,5 @@ log = get_stage_logger("snap_surface")
 def run(args, paths: PathManifest) -> None:
     log.info("Stage 06 is a stub — surface visualization work in progress.")
     log.info("fsaverage snapping is handled by stage 04.")
-    log.info("Use blender_tms_surface.py with targets_fsaverage_filtered.csv "
+    log.info("Use blender_tms_surface.py with targets_fsaverage.csv "
              "for interactive surface rendering.")
