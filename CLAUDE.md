@@ -67,25 +67,66 @@ stages/stage_06_snap_surface.py  → stub (Blender integration, future)
 
 **`staging.py`** — generic stage runner. Validates output file existence post-execution. The only place where stage skip/force logic lives.
 
-**`utils/affine.py`** — pure numpy coordinate transforms: RAS↔LPS conversions, voxel↔mm via NIfTI affine, NextStim-specific axis mapping with optional X-flip. No side effects.
+**`utils/affine.py`** — pure numpy coordinate transforms: RAS↔LPS conversions, voxel↔mm via NIfTI affine, orientation-aware NextStim axis mapping, optional X-flip. No side effects.
 
 **`utils/atlas.py`** — Harvard-Oxford atlas lookups and glass brain plotting with stimulation markers and atlas contours.
 
 ### Coordinate Systems
 
 This is the most complex part of the codebase. Four coordinate systems are involved:
-1. **NextStim NBE**: proprietary mm space
-2. **MRI Native**: NIfTI RAS (or LAS/PIR depending on scan orientation)
+1. **NextStim NBE**: fixed anatomical frame, mm from image corner (voxel 0,0,0)
+2. **MRI Native**: NIfTI physical space (RAS, PIR, PIL, IPR, or LAS depending on scanner)
 3. **ANTs**: uses LPS (opposite handedness from NIfTI RAS)
 4. **MNI152**: standard RAS space; negative X = left hemisphere
 
-**Hemisphere convention**: L (MRI left) = NextStim right ear side = higher X in RAS space. Use `--no-flip` if hemisphere appears swapped.
+### NextStim NBE Coordinate Convention
 
-**Auto-flip retry** (stage 04): if hemisphere check fails or all EF coordinates land out-of-bounds, the stage automatically retries with the opposite X-flip and accepts whichever result has more in-bounds coordinates.
+NextStim stores coordinates in a fixed anatomical frame regardless of how the MRI
+was stored on disk:
+
+```
+NBE X  →  the image's R/L anatomical axis
+NBE Y  →  the image's S/I anatomical axis
+NBE Z  →  the image's A/P anatomical axis
+```
+
+Values are in mm measured from the image corner (voxel 0,0,0), scaled by voxel size.
+The conversion to voxel indices must be orientation-aware — see `nextstim_to_mri_voxels()`
+in `utils/affine.py`.
+
+### Non-RAS MRI Orientations
+
+Some MRI scanners store T1 images in non-RAS orientations. This occurs when the image
+is loaded directly onto the NextStim neuronavigation device without reorientation.
+The pipeline handles all observed orientations correctly via the orientation-aware
+NBE→voxel mapping in `nextstim_to_mri_voxels()`.
+
+**Validated orientations (April 2025):**
+
+| Orientation | Example subjects | Dataset |
+|-------------|-----------------|---------|
+| RAS | sub-ou1neuroc001–013, majority | ou1 |
+| PIR | sub-ou1neuroc012, sub-ou1psychc010, sub-ou1psychc018 | ou1 |
+| PIL | sub-ou1psychc012, sub-ou1psychc014 | ou1 |
+| IPR | sub-ou1psychc013 | ou1 |
+| LAS | TBDPCI_12 | ou3 |
+
+**Validation method**: computed landmark voxel coordinates were entered into FreeView
+and confirmed to land on the correct anatomy (nasion, left ear, right ear) for
+representative subjects of each orientation.
+
+**Hemisphere convention**: L (MRI left) = NextStim right ear side = higher X in RAS
+space. Use `--no-flip` if hemisphere appears swapped.
+
+**Auto-flip retry** (stage 04): if hemisphere check fails or all EF coordinates land
+out-of-bounds, the stage automatically retries with the opposite X-flip and accepts
+whichever result has more in-bounds coordinates.
 
 ### Logging
 
-Logger hierarchy: `tms2mni.stages.<name>` and `tms2mni.utils.<name>`. Per-subject timestamped logs written to `outputs/<subject_id>/logs/`. File handler always captures DEBUG; console respects `--log-level`.
+Logger hierarchy: `tms2mni.stages.<name>` and `tms2mni.utils.<name>`. Per-subject
+timestamped logs written to `outputs/<subject_id>/logs/`. File handler always captures
+DEBUG; console respects `--log-level`.
 
 ### Output Structure
 

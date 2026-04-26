@@ -14,22 +14,32 @@ Automatic flip retry
 --------------------
 If the hemisphere check fails OR all EF coordinates land outside the image
 volume, the stage automatically retries with the opposite flip and logs a
-warning. Common for LAS images.
+warning.
 
-Orientation-aware ANTs point transform
+Orientation-aware NBE→voxel conversion
 ---------------------------------------
-antsApplyTransformsToPoints expects LPS physical coordinates in the same
-physical space as the moving image. For non-RAS images (PIR, LAS etc) the
-physical coords from voxels_to_mm() are NOT in RAS — they are in scanner
-physical space. We use nibabel's orientation transform to reorient to RAS
-first, then negate X/Y for LPS, before passing to ANTs.
+nextstim_to_mri_voxels() reads the image orientation codes from the affine
+and assigns NBE axes accordingly. This correctly handles RAS, PIR, PIL,
+IPR, and LAS images. The old hardcoded RAS-only mapping has been removed.
+
+ANTs point transform
+---------------------
+The NIfTI affine by definition always maps voxels to RAS mm, regardless of
+how the image is stored on disk (RAS, PIR, PIL, IPR, LAS, etc.). Therefore
+voxels_to_mm() already returns RAS mm for any orientation. To pass
+coordinates to antsApplyTransformsToPoints we simply negate X and Y to
+convert RAS→LPS. No reorientation step is needed or correct.
+
+NOTE: The previous version of this file contained a _physical_to_ras()
+function that tried to reorient native physical mm to RAS. This was wrong —
+it scrambled coordinates for non-RAS images because the NIfTI affine
+already encodes the full RAS transform. That function has been removed.
 
 fsaverage surface snapping
 ---------------------------
 MNI mm coordinates are snapped to the nearest fsaverage pial surface vertex.
 Hemisphere is routed by the sign of MNI X (negative = left), with cross-
-hemisphere fallback for near-midline points.  Snap distance is reported in
-the output CSV for QC.
+hemisphere fallback for near-midline points.
 """
 
 from __future__ import annotations
@@ -88,14 +98,18 @@ def run(args, paths: PathManifest) -> None:
     x_midpoint = dim_x / 2.0
     t1_ltr     = bool(affine[0, 0] > 0)
 
-    log.info("T1 dimensions  : %s", shape)
-    log.info("Voxel sizes    : %.4f x %.4f x %.4f mm", vox_x, vox_y, vox_z)
-    log.info("X orientation  : %s",
-             "Left-to-Right (RAS)" if t1_ltr else "Right-to-Left (LAS)")
-
     current_ornt = ornt.io_orientation(affine)
     ornt_codes   = ornt.ornt2axcodes(current_ornt)
-    log.info("Physical space : %s", "".join(ornt_codes))
+
+    log.info("T1 dimensions  : %s", shape)
+    log.info("Voxel sizes    : %.4f x %.4f x %.4f mm", vox_x, vox_y, vox_z)
+    log.info("Orientation    : %s", "".join(ornt_codes))
+    log.info("X orientation  : %s",
+             "Left-to-Right (RAS-like)" if t1_ltr else "Right-to-Left (LAS-like)")
+
+    if "".join(ornt_codes) != "RAS":
+        log.info("Non-RAS orientation detected — using orientation-aware "
+                 "NBE→voxel mapping (validated for RAS, PIR, PIL, IPR, LAS).")
 
     tgt_df = read_targets(paths.targets_csv)
     lm_df  = read_landmarks(paths.landmarks_csv)
@@ -109,7 +123,6 @@ def run(args, paths: PathManifest) -> None:
     log.info("X flip         : %s (initial)", "ON" if flip_x else "OFF")
 
     result = _attempt(tgt_df, lm_df, flip_x,
-                      dim_x, vox_x, vox_y, vox_z,
                       affine, shape, x_midpoint, t1_ltr)
 
     # ------------------------------------------------------------------ #
@@ -129,7 +142,6 @@ def run(args, paths: PathManifest) -> None:
                     ", ".join(reasons), not flip_x)
 
         retry = _attempt(tgt_df, lm_df, not flip_x,
-                         dim_x, vox_x, vox_y, vox_z,
                          affine, shape, x_midpoint, t1_ltr)
 
         retry_in, retry_total = retry["ef_bounds"]
@@ -197,14 +209,14 @@ def run(args, paths: PathManifest) -> None:
         log.error("Registration transforms not found — run stage 03 first.")
         raise RuntimeError("Missing ANTs transforms for MNI coordinate warp.")
 
-    lm_mm     = result["lm_mm"]
-    lm_df     = read_landmarks(paths.landmarks_csv)
-    mni_img   = nib.load(str(paths.mni_template))
+    lm_mm   = result["lm_mm"]
+    lm_df   = read_landmarks(paths.landmarks_csv)
+    mni_img = nib.load(str(paths.mni_template))
 
-    ef_mni_mm   = _apply_ants_transform(ef_mm,   ef_mask,   paths, affine)
-    coil_mni_mm = _apply_ants_transform(coil_mm, coil_mask, paths, affine)
+    ef_mni_mm   = _apply_ants_transform(ef_mm,   ef_mask,   paths)
+    coil_mni_mm = _apply_ants_transform(coil_mm, coil_mask, paths)
     lm_mni_mm   = _apply_ants_transform(
-        lm_mm, np.ones(len(lm_mm), dtype=bool), paths, affine)
+        lm_mm, np.ones(len(lm_mm), dtype=bool), paths)
 
     ef_mni_vox   = np.full(ef_mni_mm.shape,   np.nan)
     coil_mni_vox = np.full(coil_mni_mm.shape, np.nan)
@@ -258,14 +270,11 @@ def _norm_id(s) -> str:
 
 
 def _filter_df(df: pd.DataFrame, ids: list[str] | None) -> pd.DataFrame:
-    """Return rows matching the requested IDs, or all rows if --id all."""
     if ids is None:
-        return df.iloc[0:0]   # empty — no IDs requested
-
+        return df.iloc[0:0]
     use_all = len(ids) == 1 and ids[0].strip().lower() == "all"
     if use_all:
         return df.copy()
-
     id_set = {_norm_id(i) for i in ids}
     mask   = df["id"].apply(_norm_id).isin(id_set)
     return df[mask].copy()
@@ -278,7 +287,6 @@ def _write_summary(
     args,
     paths:     PathManifest,
 ) -> None:
-    """Merge filtered rows from native, MNI, and fsaverage into one summary CSV."""
     if args.ids is None or paths.targets_summary is None:
         return
 
@@ -296,7 +304,6 @@ def _write_summary(
         out[f"ef_native_mm_{ax}"] = filtered_native[f"ef_native_mm_{ax}"].values
     out["ef_hemisphere"] = filtered_native["ef_hemisphere"].values
 
-    # MNI + fsaverage: prefer fs_df (has mni cols + snap cols); fall back to mni_df
     mni_source = None
     if fs_df is not None:
         mni_source = _filter_df(fs_df, args.ids)
@@ -335,7 +342,7 @@ def _write_summary(
 
 
 # =============================================================================
-# fsaverage surface snapping  (moved from stage 06)
+# fsaverage surface snapping
 # =============================================================================
 
 def _snap_to_fsaverage(
@@ -343,16 +350,6 @@ def _snap_to_fsaverage(
     paths:  PathManifest,
     args,
 ) -> pd.DataFrame:
-    """
-    Snap MNI152 EF coordinates to the nearest fsaverage pial vertex.
-
-    Adds columns: fs_vertex, fs_surface, fs_x, fs_y, fs_z,
-                  snap_distance_mm, fsaverage_mesh.
-
-    Hemisphere routing uses the sign of ef_mni_mm_x (negative = left) —
-    this is always correct in MNI RAS space and avoids the native-space
-    mislabelling issue.
-    """
     mesh = getattr(args, "fsaverage_mesh", DEFAULT_MESH)
     log.info("Loading fsaverage surfaces (mesh=%s)...", mesh)
 
@@ -377,7 +374,6 @@ def _snap_to_fsaverage(
 
         pt = np.array([x, y, z], dtype=float)
 
-        # Route by MNI X sign — always correct in RAS
         if x < 0:
             primary_coords  = lh_coords
             primary_label   = f"{mesh}_pial_left"
@@ -402,10 +398,6 @@ def _snap_to_fsaverage(
             surface_name = fallback_label
             snapped      = fallback_coords[f_idx]
             dist         = f_dist
-            log.debug(
-                "Row %s: cross-hemisphere snap (%.1f mm → %s, was %.1f mm → %s)",
-                row.get("id", "?"), f_dist, fallback_label, p_dist, primary_label,
-            )
 
         results.append({
             "fs_vertex":        int(vertex_idx),
@@ -423,8 +415,7 @@ def _snap_to_fsaverage(
     write_csv(output_df, paths.targets_fsaverage)
     log.info("fsaverage CSV  : %s", paths.targets_fsaverage)
 
-    # QC summary
-    valid   = snap_df["snap_distance_mm"].dropna()
+    valid = snap_df["snap_distance_mm"].dropna()
     if len(valid):
         log.info("Snap distance summary (mm):")
         log.info("  Mean   : %.2f", valid.mean())
@@ -437,7 +428,6 @@ def _snap_to_fsaverage(
                 "%d point(s) snapped > 20 mm — may be subcortical or outside cortex.",
                 n_large)
 
-    # Cross-hemisphere snap warnings
     for idx, srow in snap_df.iterrows():
         if not isinstance(srow["fs_surface"], str):
             continue
@@ -471,7 +461,6 @@ def _nearest_vertex(
     point: np.ndarray,
     vertices: np.ndarray,
 ) -> tuple[int, float]:
-    """Vectorised nearest-vertex search. ~1 ms for 163k-vertex fsaverage."""
     diff = vertices - point
     dist = np.einsum("ij,ij->i", diff, diff)
     idx  = int(np.argmin(dist))
@@ -485,34 +474,33 @@ def _nearest_vertex(
 def _attempt(
     tgt_df, lm_df,
     flip_x: bool,
-    dim_x, vox_x, vox_y, vox_z,
     affine, shape, x_midpoint, t1_ltr,
 ) -> dict:
     """One full NBE → voxel → mm conversion attempt for a given flip_x."""
+
     lm_coords = lm_df[["x", "y", "z"]].apply(
         pd.to_numeric, errors="coerce"
     ).values.astype(float)
-    lm_vox = nextstim_to_mri_voxels(
-        lm_coords, dim_x, vox_x, vox_y, vox_z, flip_x)
+    lm_vox = nextstim_to_mri_voxels(lm_coords, affine, shape, flip_x)
     lm_mm  = voxels_to_mm(lm_vox, affine)
 
     log.info("Landmark positions (flip_x=%s):", flip_x)
     for i, row in lm_df.iterrows():
         v    = lm_vox[i]
         if not all(np.isfinite(v[d]) for d in range(3)):
-            log.warning("  %-20s  NON-FINITE ⚠️", row["landmark_type"])
+            log.warning("  %-20s  NON-FINITE", row["landmark_type"])
             continue
         in_b = all(0 <= int(round(v[d])) < shape[d] for d in range(3))
         log.info("  %-20s  [%5.0f %5.0f %5.0f]  %s",
                  row["landmark_type"], v[0], v[1], v[2],
-                 "OK" if in_b else "OUT OF BOUNDS ⚠️")
+                 "OK" if in_b else "OUT OF BOUNDS")
 
     lm_labels = lm_df["landmark_type"].tolist()
     hemi_ok   = hemisphere_check(lm_vox, lm_labels, x_midpoint, t1_ltr)
     if hemi_ok is True:
-        log.info("Hemisphere check : ✅ passed (flip_x=%s)", flip_x)
+        log.info("Hemisphere check : passed (flip_x=%s)", flip_x)
     elif hemi_ok is False:
-        log.warning("Hemisphere check : ⚠️  FAILED (flip_x=%s)", flip_x)
+        log.warning("Hemisphere check : FAILED (flip_x=%s)", flip_x)
     else:
         log.info("Hemisphere check : skipped — landmarks missing (flip_x=%s)", flip_x)
 
@@ -523,8 +511,7 @@ def _attempt(
         mask = ~np.isnan(coords).any(axis=1)
         vox  = np.full(coords.shape, np.nan)
         if mask.any():
-            vox[mask] = nextstim_to_mri_voxels(
-                coords[mask], dim_x, vox_x, vox_y, vox_z, flip_x)
+            vox[mask] = nextstim_to_mri_voxels(coords[mask], affine, shape, flip_x)
         mm = np.full(coords.shape, np.nan)
         if mask.any():
             mm[mask] = voxels_to_mm(vox[mask], affine)
@@ -560,41 +547,27 @@ def _attempt(
 
 
 # =============================================================================
-# ANTs coordinate transform helpers
+# ANTs coordinate transform
 # =============================================================================
 
-def _physical_to_ras(coords: np.ndarray, affine: np.ndarray) -> np.ndarray:
-    """Reorient Nx3 native physical coords to RAS for ANTs."""
-    current_ornt = ornt.io_orientation(affine)
-    ras_ornt     = np.array([[0, 1], [1, 1], [2, 1]])
-    transform    = ornt.ornt_transform(current_ornt, ras_ornt)
-    result       = coords.copy().astype(float)
-    for out_ax, (in_ax, flip) in enumerate(transform):
-        result[:, int(out_ax)] = coords[:, int(in_ax)] * flip
-    return result
-
-
 def _apply_ants_transform(
-    mm_native: np.ndarray,
-    mask:      np.ndarray,
-    paths:     PathManifest,
-    affine:    np.ndarray,
+    mm_ras: np.ndarray,
+    mask:   np.ndarray,
+    paths:  PathManifest,
 ) -> np.ndarray:
     """
-    Transform Nx3 native physical mm → MNI RAS mm via antsApplyTransformsToPoints.
+    Transform Nx3 RAS mm → MNI RAS mm via antsApplyTransformsToPoints.
 
-    Pipeline:
-      native physical → RAS  (orientation-aware)
-      RAS → LPS              (negate X and Y)
-      ANTs transform
-      LPS → RAS              (negate X and Y)
+    The NIfTI affine always maps voxels to RAS mm by definition, so
+    mm_ras is already in RAS regardless of image orientation on disk.
+    We negate X and Y to get LPS for ANTs, then negate back after.
     """
-    result = np.full(mm_native.shape, np.nan)
+    result = np.full(mm_ras.shape, np.nan)
     if not mask.any():
         return result
 
-    valid_ras = _physical_to_ras(mm_native[mask], affine)
-    valid_lps = valid_ras.copy()
+    # RAS → LPS: negate X and Y
+    valid_lps = mm_ras[mask].copy()
     valid_lps[:, 0] *= -1
     valid_lps[:, 1] *= -1
 
