@@ -275,9 +275,17 @@ def _filter_df(df: pd.DataFrame, ids: list[str] | None) -> pd.DataFrame:
     use_all = len(ids) == 1 and ids[0].strip().lower() == "all"
     if use_all:
         return df.copy()
-    id_set = {_norm_id(i) for i in ids}
-    mask   = df["id"].apply(_norm_id).isin(id_set)
-    return df[mask].copy()
+
+    id_set  = {_norm_id(i) for i in ids}
+    mask    = df["id"].apply(_norm_id).isin(id_set)
+    matched = df[mask].copy()
+
+    # Preserve the order specified in --id flags, not the NBE file order
+    id_order = {_norm_id(i): pos for pos, i in enumerate(ids)}
+    matched["_sort_key"] = matched["id"].apply(
+        lambda x: id_order.get(_norm_id(x), 999))
+    matched = matched.sort_values("_sort_key").drop(columns="_sort_key")
+    return matched.reset_index(drop=True)
 
 
 def _write_summary(
