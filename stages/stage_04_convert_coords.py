@@ -10,6 +10,9 @@ When --id flags are provided, also writes a merged summary CSV containing
 only the requested rows with key columns from all three spaces:
   - targets_summary.csv
 
+The summary CSV includes atlas label columns for all configured atlases
+(Harvard-Oxford, AAL, Destrieux, Schaefer 100-1000, Yeo 7/17).
+
 Automatic flip retry
 --------------------
 If the hemisphere check fails OR all EF coordinates land outside the image
@@ -19,27 +22,18 @@ warning.
 Orientation-aware NBE→voxel conversion
 ---------------------------------------
 nextstim_to_mri_voxels() reads the image orientation codes from the affine
-and assigns NBE axes accordingly. This correctly handles RAS, PIR, PIL,
-IPR, and LAS images. The old hardcoded RAS-only mapping has been removed.
+and assigns NBE axes accordingly. Validated for RAS, PIR, PIL, IPR, LAS.
 
 ANTs point transform
 ---------------------
 The NIfTI affine by definition always maps voxels to RAS mm, regardless of
-how the image is stored on disk (RAS, PIR, PIL, IPR, LAS, etc.). Therefore
-voxels_to_mm() already returns RAS mm for any orientation. To pass
-coordinates to antsApplyTransformsToPoints we simply negate X and Y to
-convert RAS→LPS. No reorientation step is needed or correct.
+image orientation on disk. voxels_to_mm() therefore already returns RAS mm
+for any orientation. We simply negate X and Y to convert RAS→LPS for ANTs.
 
-NOTE: The previous version of this file contained a _physical_to_ras()
-function that tried to reorient native physical mm to RAS. This was wrong —
-it scrambled coordinates for non-RAS images because the NIfTI affine
-already encodes the full RAS transform. That function has been removed.
-
-fsaverage surface snapping
----------------------------
-MNI mm coordinates are snapped to the nearest fsaverage pial surface vertex.
-Hemisphere is routed by the sign of MNI X (negative = left), with cross-
-hemisphere fallback for near-midline points.
+--id ordering
+-------------
+The summary CSV rows are output in the same order as --id flags were
+specified on the command line, not in NBE file order.
 """
 
 from __future__ import annotations
@@ -53,7 +47,7 @@ import numpy as np
 import nibabel as nib
 import pandas as pd
 
-from utils.atlas import label_coords
+from utils.atlas import label_coords_all, ATLAS_KEYS, ATLAS_COL_NAMES
 from utils.affine import (
     nextstim_to_mri_voxels,
     voxel_sizes_from_affine,
@@ -178,7 +172,7 @@ def run(args, paths: PathManifest) -> None:
     coil_hemi = label_hemisphere(coil_vox[:, 0], x_midpoint, t1_ltr)
 
     # ------------------------------------------------------------------ #
-    # Write targets_native.csv  (full)
+    # Write targets_native.csv
     # ------------------------------------------------------------------ #
     native_df = tgt_df.copy()
     for axis, idx in [("x", 0), ("y", 1), ("z", 2)]:
@@ -270,8 +264,14 @@ def _norm_id(s) -> str:
 
 
 def _filter_df(df: pd.DataFrame, ids: list[str] | None) -> pd.DataFrame:
+    """
+    Return rows matching the requested IDs.
+    Output is ordered to match the order of ids (i.e. --id flag order),
+    not the order rows appear in the NBE file.
+    """
     if ids is None:
         return df.iloc[0:0]
+
     use_all = len(ids) == 1 and ids[0].strip().lower() == "all"
     if use_all:
         return df.copy()
@@ -280,7 +280,7 @@ def _filter_df(df: pd.DataFrame, ids: list[str] | None) -> pd.DataFrame:
     mask    = df["id"].apply(_norm_id).isin(id_set)
     matched = df[mask].copy()
 
-    # Preserve the order specified in --id flags, not the NBE file order
+    # Sort to match --id flag order
     id_order = {_norm_id(i): pos for pos, i in enumerate(ids)}
     matched["_sort_key"] = matched["id"].apply(
         lambda x: id_order.get(_norm_id(x), 999))
@@ -295,6 +295,7 @@ def _write_summary(
     args,
     paths:     PathManifest,
 ) -> None:
+    """Merge filtered rows from native, MNI, and fsaverage into one summary CSV."""
     if args.ids is None or paths.targets_summary is None:
         return
 
@@ -328,25 +329,35 @@ def _write_summary(
             for x in mni_x
         ]
 
-        coords = mni_source[["ef_mni_mm_x", "ef_mni_mm_y", "ef_mni_mm_z"]].values
+        # Atlas labels — all atlases
+        coords     = mni_source[["ef_mni_mm_x", "ef_mni_mm_y",
+                                  "ef_mni_mm_z"]].values
         valid_mask = ~np.isnan(coords).any(axis=1)
-        labels: list = [None] * len(coords)
-        if valid_mask.any():
-            valid_labels = label_coords(coords[valid_mask])
-            j = 0
-            for i, v in enumerate(valid_mask):
-                if v:
-                    labels[i] = valid_labels[j]
-                    j += 1
-        out["ho_region"] = labels
 
+        all_labels: dict = {k: ["no_region"] * len(coords) for k in ATLAS_KEYS}
+        if valid_mask.any():
+            log.info("Labelling %d coordinate(s) against %d atlases...",
+                     valid_mask.sum(), len(ATLAS_KEYS))
+            valid_atlas = label_coords_all(coords[valid_mask])
+            for key in ATLAS_KEYS:
+                j = 0
+                for i, v in enumerate(valid_mask):
+                    if v:
+                        all_labels[key][i] = valid_atlas[key][j]
+                        j += 1
+
+        for key in ATLAS_KEYS:
+            out[ATLAS_COL_NAMES[key]] = all_labels[key]
+
+        # fsaverage snap columns
         if "snap_distance_mm" in mni_source.columns:
             for ax in ("x", "y", "z"):
                 out[f"fs_{ax}"] = mni_source[f"fs_{ax}"].values
             out["snap_distance_mm"] = mni_source["snap_distance_mm"].values
 
     write_csv(out, paths.targets_summary)
-    log.info("Summary CSV    : %s  (%d rows)", paths.targets_summary, len(out))
+    log.info("Summary CSV    : %s  (%d rows, %d atlas columns)",
+             paths.targets_summary, len(out), len(ATLAS_KEYS))
 
 
 # =============================================================================
@@ -406,6 +417,10 @@ def _snap_to_fsaverage(
             surface_name = fallback_label
             snapped      = fallback_coords[f_idx]
             dist         = f_dist
+            log.debug(
+                "Row %s: cross-hemisphere snap (%.1f mm → %s, was %.1f mm → %s)",
+                row.get("id", "?"), f_dist, fallback_label, p_dist, primary_label,
+            )
 
         results.append({
             "fs_vertex":        int(vertex_idx),
@@ -574,7 +589,7 @@ def _apply_ants_transform(
     if not mask.any():
         return result
 
-    # RAS → LPS: negate X and Y
+    # RAS → LPS
     valid_lps = mm_ras[mask].copy()
     valid_lps[:, 0] *= -1
     valid_lps[:, 1] *= -1

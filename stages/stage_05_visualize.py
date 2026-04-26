@@ -2,13 +2,18 @@
 stages/stage_05_visualize.py
 =============================
 Stage 05: Plot selected stimulation sites on a nilearn glass brain,
-generate a Harvard-Oxford atlas overlay, and optionally append MNI
-coordinates to a shared cross-subject CSV.
+generate atlas overlay plots for all configured atlases, and optionally
+append MNI coordinates to a shared cross-subject CSV.
 
 Outputs (plotted rows selected by --id):
   stimulation_sites.html  — interactive 3D glass brain
   stimulation_sites.png   — static 4-panel (L/coronal/axial/R)
-  ho_regions.png          — glass brain with HO atlas contours (MNI only)
+  ho_regions.png          — Harvard-Oxford atlas overlay
+  aal_regions.png         — AAL atlas overlay
+  destrieux_regions.png   — Destrieux atlas overlay
+  schaefer_*_regions.png  — Schaefer atlas overlays (100-1000 parcels)
+  yeo_7_regions.png       — Yeo 7-network overlay
+  yeo_17_regions.png      — Yeo 17-network overlay
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from utils.atlas import plot_all_atlases, ATLAS_KEYS
 from utils.io import PathManifest, write_csv
 from utils.logger import get_stage_logger
 
@@ -52,7 +58,6 @@ def run(args, paths: PathManifest) -> None:
 
     df = pd.read_csv(csv_path, na_values=["-", " -", "- "])
 
-    # Normalise IDs
     def _norm(s):
         return str(s).strip().rstrip(".")
 
@@ -77,7 +82,6 @@ def run(args, paths: PathManifest) -> None:
 
     coords = selected[[mm_x_col, mm_y_col, mm_z_col]].values
 
-    # Hemisphere — derived from MNI X sign when available, else from column
     if is_mni:
         hemi_labels = ["L" if x < 0 else "R" for x in coords[:, 0]]
     else:
@@ -89,7 +93,6 @@ def run(args, paths: PathManifest) -> None:
     log.info("Left  hemisphere: %d points", n_left)
     log.info("Right hemisphere: %d points", n_right)
 
-    # Colours
     if args.color_by_hemi:
         colors = ["#4488FF" if h == "L" else "#FF4444" for h in hemi_labels]
         log.info("Colour mode: by hemisphere  L=#4488FF  R=#FF4444")
@@ -153,26 +156,25 @@ def run(args, paths: PathManifest) -> None:
     log.info("PNG  saved : %s", paths.png_out)
 
     # ------------------------------------------------------------------ #
-    # Harvard-Oxford atlas plot (MNI only)
+    # Atlas overlay plots (MNI only)
     # ------------------------------------------------------------------ #
     if is_mni:
-        log.info("Building Harvard-Oxford atlas overlay...")
-        try:
-            from utils.atlas import plot_ho_regions
-            plot_ho_regions(
-                coords_mm   = coords,
-                hemi_labels = hemi_labels,
-                out_path    = str(paths.ho_regions_png),
-                color_left  = "#4488FF",
-                color_right = "#FF4444",
-                marker_size = args.marker_size,
-                title       = None,
-            )
-            log.info("HO regions : %s", paths.ho_regions_png)
-        except Exception as exc:
-            log.warning("HO atlas plot failed (non-fatal): %s", exc)
+        log.info("Building atlas overlay plots (%d atlases)...", len(ATLAS_KEYS))
+        color_left  = "#4488FF" if args.color_by_hemi else "#FF4444"
+        color_right = "#FF4444"
+
+        out_paths = plot_all_atlases(
+            coords_mm   = coords,
+            hemi_labels = hemi_labels,
+            out_dir     = str(paths.viz_dir),
+            color_left  = color_left,
+            color_right = color_right,
+            marker_size = args.marker_size,
+        )
+        for key, path in out_paths.items():
+            log.info("Atlas plot (%s) : %s", key, path)
     else:
-        log.info("Skipping HO atlas plot (native space coordinates — no MNI).")
+        log.info("Skipping atlas plots (native space — no MNI coordinates).")
 
     # ------------------------------------------------------------------ #
     # Shared CSV append
@@ -194,6 +196,21 @@ def _append_shared_csv(
     args,
     paths: PathManifest,
 ) -> None:
+    # Re-sort selected to match --id flag order before appending
+    def _norm(s):
+        return str(s).strip().rstrip(".")
+
+    if args.ids and not (len(args.ids) == 1 and args.ids[0].strip().lower() == "all"):
+        id_order = {_norm(i): pos for pos, i in enumerate(args.ids)}
+        selected = selected.copy()
+        selected["_sort_key"] = selected["id"].apply(
+            lambda x: id_order.get(_norm(x), 999))
+        selected = selected.sort_values("_sort_key").drop(columns="_sort_key")
+        selected = selected.reset_index(drop=True)
+        # Rebuild hemi_labels to match new order
+        hemi_labels = ["L" if selected.iloc[i][mm_x_col] < 0 else "R"
+                       for i in range(len(selected))]
+
     rows = []
     for i, (_, row) in enumerate(selected.iterrows()):
         x = row[mm_x_col]

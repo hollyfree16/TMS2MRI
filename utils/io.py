@@ -13,6 +13,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from utils.atlas import ATLAS_KEYS, ATLAS_PNG_STEMS
+
 
 # =============================================================================
 # Path manifest
@@ -23,57 +25,56 @@ class PathManifest:
     """
     All expected input and output paths for a single subject run.
     Constructed once in cli.py and passed through to every stage.
-
-    Stages declare which paths they consume and produce — they never
-    construct paths themselves.
     """
 
     # --- Inputs ---
     nbe:              Path
     t1:               Path
-    mni_template:     Path | None   # brain-extracted MNI152
-    mni_template_full: Path | None  # full-head MNI152
+    mni_template:     Path | None
+    mni_template_full: Path | None
 
     # --- Subject root ---
-    subject_dir:      Path          # <output_dir>/<subject_id>/
+    subject_dir:      Path
 
     # --- Stage output directories ---
-    xnbe_dir:         Path          # 01_parse_nbe output
-    reg_dir:          Path          # 03_register_mni output
-    coords_dir:       Path          # 04_convert_coords output
-    viz_dir:          Path          # 05_visualize output
-    log_dir:          Path          # per-subject logs
+    xnbe_dir:         Path
+    reg_dir:          Path
+    coords_dir:       Path
+    viz_dir:          Path
+    log_dir:          Path
 
-    # --- Stage output files ---
-    # 01_parse_nbe
+    # --- Stage 01 ---
     landmarks_csv:    Path
     targets_csv:      Path
     targets_xlsx:     Path
 
-    # 02_skullstrip
+    # --- Stage 02 ---
     t1_brain:         Path
 
-    # 03_register_mni
+    # --- Stage 03 ---
     affine_mat:       Path
     warp:             Path
     inv_warp:         Path
-    t1_in_mni:        Path | None   # only if mni_template_full provided
+    t1_in_mni:        Path | None
 
-    # 04_convert_coords  (full — all rows)
+    # --- Stage 04 (full) ---
     targets_native:       Path
-    targets_mni:          Path | None   # only if mni registration enabled
-    targets_fsaverage:    Path | None   # only if mni registration enabled
+    targets_mni:          Path | None
+    targets_fsaverage:    Path | None
 
-    # 04_convert_coords  (summary — filtered rows merged, written when ids provided)
+    # --- Stage 04 (summary) ---
     targets_summary:  Path | None
 
-    # 05_visualize
+    # --- Stage 05 visualization ---
     html_out:         Path
     png_out:          Path
-    ho_regions_png:   Path          # subject-level HO atlas plot
 
-    # --- Shared CSV (optional, cross-subject) ---
-    shared_csv:       Path | None   = None
+    # Atlas PNGs — one per atlas key, stored as a dict
+    # e.g. atlas_pngs["harvard_oxford"] = viz_dir / "ho_regions.png"
+    atlas_pngs:       dict = field(default_factory=dict)
+
+    # --- Shared CSV ---
+    shared_csv:       Path | None = None
 
     @classmethod
     def build(
@@ -87,35 +88,31 @@ class PathManifest:
         shared_csv:        Path | None = None,
         has_ids:           bool = False,
     ) -> "PathManifest":
-        """
-        Construct a fully-populated PathManifest from the top-level arguments.
-        All paths derived deterministically — no path construction elsewhere.
-
-        Parameters
-        ----------
-        has_ids : True when --id flags were passed. Controls whether filtered
-                  CSV paths are populated (non-None).
-        """
         sub    = output_dir / subject_id
         xnbe   = sub / "xnbe"
         reg    = sub / "registration"
         coords = sub / "coordinates"
         viz    = sub / "visualization"
         logs   = sub / "logs"
-        reg_px = reg / "sub_to_MNI_"   # ANTs prefix
+        reg_px = reg / "sub_to_MNI_"
 
         targets_native    = coords / "targets_native.csv"
         targets_mni       = (coords / "targets_mni.csv")       if mni_template else None
         targets_fsaverage = (coords / "targets_fsaverage.csv") if mni_template else None
 
+        # Build atlas PNG paths for all atlases
+        atlas_pngs = {}
+        if mni_template:
+            for key in ATLAS_KEYS:
+                stem = ATLAS_PNG_STEMS.get(key, f"{key}_regions")
+                atlas_pngs[key] = viz / f"{stem}.png"
+
         return cls(
-            # inputs
             nbe               = nbe,
             t1                = t1,
             mni_template      = mni_template,
             mni_template_full = mni_template_full,
 
-            # dirs
             subject_dir       = sub,
             xnbe_dir          = xnbe,
             reg_dir           = reg,
@@ -123,50 +120,36 @@ class PathManifest:
             viz_dir           = viz,
             log_dir           = logs,
 
-            # 01
             landmarks_csv     = xnbe / f"landmarks_{subject_id}.csv",
             targets_csv       = xnbe / f"targets_{subject_id}.csv",
             targets_xlsx      = xnbe / f"targets_{subject_id}.xlsx",
 
-            # 02
             t1_brain          = reg / "T1_brain.nii.gz",
 
-            # 03
             affine_mat        = Path(str(reg_px) + "0GenericAffine.mat"),
             warp              = Path(str(reg_px) + "1Warp.nii.gz"),
             inv_warp          = Path(str(reg_px) + "1InverseWarp.nii.gz"),
             t1_in_mni         = (reg / "T1_in_MNI.nii.gz") if mni_template_full else None,
 
-            # 04 full
             targets_native    = targets_native,
             targets_mni       = targets_mni,
             targets_fsaverage = targets_fsaverage,
 
-            # 04 summary
-            targets_summary            = (coords / "targets_summary.csv") if has_ids else None,
+            targets_summary   = (coords / "targets_summary.csv") if has_ids else None,
 
-            # 05
             html_out          = viz / "stimulation_sites.html",
             png_out           = viz / "stimulation_sites.png",
-            ho_regions_png    = viz / "ho_regions.png",
 
-            # optional
+            atlas_pngs        = atlas_pngs,
+
             shared_csv        = shared_csv,
         )
 
     def required_dirs(self) -> list[Path]:
-        """All directories that must exist before the pipeline runs."""
         return [self.xnbe_dir, self.reg_dir, self.coords_dir,
                 self.viz_dir,  self.log_dir]
 
     def stage_outputs(self, stage: str) -> list[Path]:
-        """
-        Return the list of output paths that determine whether a stage
-        can be skipped (all must exist).
-
-        stage: one of 'parse', 'skullstrip', 'register', 'convert',
-               'visualize', 'snap'
-        """
         if stage == "parse":
             return [self.landmarks_csv, self.targets_csv]
 
@@ -191,13 +174,11 @@ class PathManifest:
 
         if stage == "visualize":
             outs = [self.html_out, self.png_out]
-            # ho_regions_png is produced when MNI coords are available
-            if self.targets_mni is not None:
-                outs.append(self.ho_regions_png)
+            # All atlas PNGs are expected outputs when MNI is available
+            outs.extend(self.atlas_pngs.values())
             return outs
 
         if stage == "snap":
-            # Stage 06 is now a stub — no mandatory outputs yet
             return []
 
         raise ValueError(f"Unknown stage: {stage!r}")
@@ -208,7 +189,6 @@ class PathManifest:
 # =============================================================================
 
 def read_targets(path: Path) -> pd.DataFrame:
-    """Read a targets CSV, treating common NA sentinels correctly."""
     return pd.read_csv(path, na_values=["-", " -", "- "])
 
 
