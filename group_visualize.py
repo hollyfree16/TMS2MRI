@@ -712,8 +712,8 @@ def main() -> None:
     except ImportError:
         atlas_cols = []
 
-    out_cols = (["subject_id", "site", "mni_mm_x", "mni_mm_y", "mni_mm_z",
-                 "hemisphere", "mni_hemisphere"] + atlas_cols)
+    out_cols = (["subject_id", "site", "id", "mni_mm_x", "mni_mm_y", "mni_mm_z", "hemisphere", "mni_hemisphere", "fs_x", "fs_y", "fs_z", "snap_distance_mm", "fs_surface"] + atlas_cols)
+    
     out_cols = [c for c in out_cols if c in combined.columns]
 
     csv_path = os.path.join(args.output_dir, f"{args.output_prefix}_all_sites.csv")

@@ -163,26 +163,52 @@ def _load_atlas(key: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
             ]
 
         elif key == "yeo_7":
-            yeo    = datasets.fetch_atlas_yeo_2011()
-            img    = nib.load(yeo.thick_7)
-            labels = [
-                "background",
-                "Visual",
-                "Somatomotor",
-                "Dorsal Attention",
-                "Ventral Attention",
-                "Limbic",
-                "Frontoparietal",
-                "Default",
-            ]
+            try:
+                # nilearn >= 0.10: returns Atlas object with .maps
+                yeo  = datasets.fetch_atlas_yeo_2011(n_networks=7, thickness="thick")
+                img  = nib.load(yeo.maps) if isinstance(yeo.maps, str) else yeo.maps
+                if hasattr(yeo, "labels") and yeo.labels:
+                    labels = ["background"] + list(yeo.labels)
+                else:
+                    labels = [
+                        "background", "Visual", "Somatomotor",
+                        "Dorsal Attention", "Ventral Attention",
+                        "Limbic", "Frontoparietal", "Default",
+                    ]
+            except TypeError:
+                # older nilearn: fetch_atlas_yeo_2011() returns Bunch with thick_7
+                yeo  = datasets.fetch_atlas_yeo_2011()
+                img  = nib.load(yeo.thick_7)
+                labels = [
+                    "background", "Visual", "Somatomotor",
+                    "Dorsal Attention", "Ventral Attention",
+                    "Limbic", "Frontoparietal", "Default",
+                ]
 
         elif key == "yeo_17":
-            yeo    = datasets.fetch_atlas_yeo_2011()
-            img    = nib.load(yeo.thick_17)
-            labels = [
-                "background",
-                "Visual A", "Visual B",
-                "Somatomotor A", "Somatomotor B",
+            try:
+                yeo  = datasets.fetch_atlas_yeo_2011(n_networks=17, thickness="thick")
+                img  = nib.load(yeo.maps) if isinstance(yeo.maps, str) else yeo.maps
+                if hasattr(yeo, "labels") and yeo.labels:
+                    labels = ["background"] + list(yeo.labels)
+                else:
+                    labels = [
+                        "background",
+                        "Visual A", "Visual B",
+                        "Somatomotor A", "Somatomotor B",
+                        "Dorsal Attention A", "Dorsal Attention B",
+                        "Salience/Ventral Attention A", "Salience/Ventral Attention B",
+                        "Limbic A", "Limbic B",
+                        "Control A", "Control B", "Control C",
+                        "Default A", "Default B", "Default C",
+                    ]
+            except TypeError:
+                yeo  = datasets.fetch_atlas_yeo_2011()
+                img  = nib.load(yeo.thick_17)
+                labels = [
+                    "background",
+                    "Visual A", "Visual B",
+                    "Somatomotor A", "Somatomotor B",
                 "Dorsal Attention A", "Dorsal Attention B",
                 "Salience/Ventral Attention A", "Salience/Ventral Attention B",
                 "Limbic A", "Limbic B",

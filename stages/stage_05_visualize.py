@@ -2,18 +2,22 @@
 stages/stage_05_visualize.py
 =============================
 Stage 05: Plot selected stimulation sites on a nilearn glass brain,
-generate atlas overlay plots for all configured atlases, and optionally
-append MNI coordinates to a shared cross-subject CSV.
+generate atlas overlay plots for all configured atlases, and append
+MNI coordinates to a shared cross-subject CSV.
+
+The shared CSV now includes:
+  - MNI mm coordinates
+  - fsaverage surface coordinates (fs_x, fs_y, fs_z, fs_surface)
+  - snap_distance_mm
+  - all atlas label columns (region_harvard_oxford, region_destrieux, etc.)
+
+This makes the shared CSV directly usable by atlas_snap.py for
+post-processing without needing to re-process per-subject files.
 
 Outputs (plotted rows selected by --id):
   stimulation_sites.html  — interactive 3D glass brain
   stimulation_sites.png   — static 4-panel (L/coronal/axial/R)
-  ho_regions.png          — Harvard-Oxford atlas overlay
-  aal_regions.png         — AAL atlas overlay
-  destrieux_regions.png   — Destrieux atlas overlay
-  schaefer_*_regions.png  — Schaefer atlas overlays (100-1000 parcels)
-  yeo_7_regions.png       — Yeo 7-network overlay
-  yeo_17_regions.png      — Yeo 17-network overlay
+  ho_regions.png + all other atlas PNGs
 """
 
 from __future__ import annotations
@@ -196,10 +200,17 @@ def _append_shared_csv(
     args,
     paths: PathManifest,
 ) -> None:
-    # Re-sort selected to match --id flag order before appending
+    """
+    Append selected rows to the shared cross-subject CSV.
+
+    Includes MNI mm, fsaverage surface coords, snap distance, and all
+    atlas label columns — pulled from targets_summary.csv so the shared
+    CSV can be used directly by atlas_snap.py without per-subject processing.
+    """
     def _norm(s):
         return str(s).strip().rstrip(".")
 
+    # Sort to match --id flag order
     if args.ids and not (len(args.ids) == 1 and args.ids[0].strip().lower() == "all"):
         id_order = {_norm(i): pos for pos, i in enumerate(args.ids)}
         selected = selected.copy()
@@ -207,32 +218,69 @@ def _append_shared_csv(
             lambda x: id_order.get(_norm(x), 999))
         selected = selected.sort_values("_sort_key").drop(columns="_sort_key")
         selected = selected.reset_index(drop=True)
-        # Rebuild hemi_labels to match new order
         hemi_labels = ["L" if selected.iloc[i][mm_x_col] < 0 else "R"
                        for i in range(len(selected))]
 
+    # Load the summary CSV to get fsaverage + atlas columns
+    summary_df = None
+    if paths.targets_summary is not None and paths.targets_summary.exists():
+        try:
+            summary_df = pd.read_csv(paths.targets_summary,
+                                     na_values=["-", " -", "- "])
+            summary_df["_id_norm"] = summary_df["id"].apply(_norm)
+            log.debug("Loaded summary CSV for shared CSV enrichment: %d rows",
+                      len(summary_df))
+        except Exception as e:
+            log.warning("Could not load summary CSV for enrichment: %s", e)
+            summary_df = None
+
     rows = []
     for i, (_, row) in enumerate(selected.iterrows()):
-        x = row[mm_x_col]
-        rows.append({
+        x      = row[mm_x_col]
+        row_id = _norm(str(row["id"]))
+
+        entry = {
             "subject_id":     args.subject_id,
             "site":           args.site,
             "id":             str(row["id"]).strip().rstrip("."),
-            "mni_mm_x":       round(x, 2),
-            "mni_mm_y":       round(row[mm_y_col], 2),
-            "mni_mm_z":       round(row[mm_z_col], 2),
+            "mni_mm_x":       round(float(x), 2),
+            "mni_mm_y":       round(float(row[mm_y_col]), 2),
+            "mni_mm_z":       round(float(row[mm_z_col]), 2),
             "hemisphere":     row.get("ef_hemisphere", hemi_labels[i]),
             "mni_hemisphere": "L" if x < 0 else "R",
-        })
+        }
+
+        # Enrich from summary CSV: fsaverage coords + atlas labels
+        if summary_df is not None:
+            match = summary_df[summary_df["_id_norm"] == row_id]
+            if not match.empty:
+                r = match.iloc[0]
+                for col in ["fs_x", "fs_y", "fs_z",
+                            "snap_distance_mm", "fs_surface"]:
+                    if col in r.index and pd.notna(r[col]):
+                        entry[col] = r[col]
+                for col in r.index:
+                    if col.startswith("region_"):
+                        entry[col] = r[col]
+
+        rows.append(entry)
 
     new_df = pd.DataFrame(rows)
 
     if paths.shared_csv.exists():
         existing = pd.read_csv(paths.shared_csv)
+        # Add any new columns introduced by this subject
+        for col in new_df.columns:
+            if col not in existing.columns:
+                existing[col] = np.nan
+        for col in existing.columns:
+            if col not in new_df.columns:
+                new_df[col] = np.nan
         combined = pd.concat([existing, new_df], ignore_index=True)
     else:
         combined = new_df
 
     paths.shared_csv.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(paths.shared_csv, index=False)
-    log.info("Shared CSV : %d rows appended → %s", len(rows), paths.shared_csv)
+    log.info("Shared CSV : %d rows appended → %s  (%d columns)",
+             len(rows), paths.shared_csv, len(combined.columns))
