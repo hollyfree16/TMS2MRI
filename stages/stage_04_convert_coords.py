@@ -5,19 +5,24 @@ Stage 04: Convert NextStim NBE coordinates to:
   - Subject native MRI voxel indices + mm  (targets_native.csv)
   - MNI152 mm coordinates via ANTs point transform  (targets_mni.csv)
   - fsaverage pial surface snapped coordinates  (targets_fsaverage.csv)
+  - targets_summary.csv  (filtered rows, when --id flags provided)
 
-When --id flags are provided, also writes a merged summary CSV containing
-only the requested rows with key columns from all three spaces:
-  - targets_summary.csv
+Automatic flip detection
+------------------------
+Two-stage auto-flip system:
 
-The summary CSV includes atlas label columns for all configured atlases
-(Harvard-Oxford, AAL, Destrieux, Schaefer 100-1000, Yeo 7/17).
+  Stage 1 (pre-ANTs): voxel-space hemisphere check using landmark voxel
+  positions. Reliable for RAS images but can fail for non-RAS orientations
+  where voxel axis 0 is not the R/L axis.
 
-Automatic flip retry
---------------------
-If the hemisphere check fails OR all EF coordinates land outside the image
-volume, the stage automatically retries with the opposite flip and logs a
-warning.
+  Stage 2 (post-ANTs): MNI landmark sanity check. After transforming
+  landmarks to MNI space, verifies:
+    - Nasion X is near midline (|X| < 25mm)
+    - Nasion Y is anterior (Y > 50mm)
+    - Left ear X is negative, right ear X is positive
+  If this fails, automatically retries with the opposite flip and accepts
+  the result if MNI landmarks become plausible. This catches flip errors
+  that slip through the voxel-space check (e.g. some LAS images).
 
 Orientation-aware NBE→voxel conversion
 ---------------------------------------
@@ -26,14 +31,13 @@ and assigns NBE axes accordingly. Validated for RAS, PIR, PIL, IPR, LAS.
 
 ANTs point transform
 ---------------------
-The NIfTI affine by definition always maps voxels to RAS mm, regardless of
-image orientation on disk. voxels_to_mm() therefore already returns RAS mm
-for any orientation. We simply negate X and Y to convert RAS→LPS for ANTs.
+The NIfTI affine always maps voxels to RAS mm by definition, so
+voxels_to_mm() already returns RAS mm for any orientation. We simply
+negate X and Y to convert RAS→LPS for ANTs.
 
 --id ordering
 -------------
-The summary CSV rows are output in the same order as --id flags were
-specified on the command line, not in NBE file order.
+Summary CSV rows are output in --id flag order, not NBE file order.
 """
 
 from __future__ import annotations
@@ -70,6 +74,87 @@ COIL_Y   = "coil_loc_y"
 COIL_Z   = "coil_loc_z"
 
 DEFAULT_MESH = "fsaverage"
+
+
+# =============================================================================
+# MNI landmark sanity check
+# =============================================================================
+
+def _check_mni_landmarks(
+    lm_mni_mm: np.ndarray,
+    lm_df:     pd.DataFrame,
+) -> bool:
+    """
+    Check whether landmark MNI coordinates are anatomically plausible.
+
+    Criteria:
+      - Nasion: |X| < 25mm (near midline), Y > 50mm (anterior)
+      - Left ear: X < 0 (left hemisphere in RAS)
+      - Right ear: X > 0 (right hemisphere in RAS)
+
+    Returns True if all available landmarks pass, False if any fail.
+    If no recognisable landmarks are found, returns True (no check possible).
+
+    Landmarks whose MNI coordinates are physically impossible (|X| > 120mm)
+    are skipped — this occurs when the landmark falls outside the valid region
+    of the ANTs warp (e.g. ear landmarks in subjects with oversized FOV images
+    where the ears are far from the brain). In that case the check falls back
+    to the voxel-space hemisphere check result from stage 1.
+    """
+    # MNI brain is ~±80mm in X — anything beyond ±120mm is warp extrapolation
+    IMPOSSIBLE_X = 120.0
+
+    labels = lm_df["landmark_type"].str.lower().tolist()
+
+    nasion_idx = next((i for i, l in enumerate(labels)
+                       if "nasion" in l or "nose" in l), None)
+    left_idx   = next((i for i, l in enumerate(labels)
+                       if "left" in l and "ear" in l), None)
+    right_idx  = next((i for i, l in enumerate(labels)
+                       if "right" in l and "ear" in l), None)
+
+    checks = []
+
+    if nasion_idx is not None:
+        n = lm_mni_mm[nasion_idx]
+        if np.any(np.isnan(n)):
+            pass
+        elif abs(n[0]) > IMPOSSIBLE_X:
+            log.warning(
+                "MNI check: nasion X=%.1f is outside valid warp region — "
+                "skipping nasion check (large FOV image?)", n[0])
+        else:
+            nasion_x_ok = abs(n[0]) < 25
+            nasion_y_ok = n[1] > 50
+            if not nasion_x_ok:
+                log.debug("MNI check: nasion X=%.1f is not near midline", n[0])
+            if not nasion_y_ok:
+                log.debug("MNI check: nasion Y=%.1f is not anterior", n[1])
+            checks.extend([nasion_x_ok, nasion_y_ok])
+
+    if left_idx is not None and right_idx is not None:
+        l = lm_mni_mm[left_idx]
+        r = lm_mni_mm[right_idx]
+        if np.any(np.isnan(l)) or np.any(np.isnan(r)):
+            pass
+        elif abs(l[0]) > IMPOSSIBLE_X or abs(r[0]) > IMPOSSIBLE_X:
+            log.warning(
+                "MNI check: ear landmarks outside valid warp region "
+                "(left X=%.1f, right X=%.1f) — skipping ear check "
+                "(large FOV image?)", l[0], r[0])
+        else:
+            hemi_ok = l[0] < 0 and r[0] > 0
+            if not hemi_ok:
+                log.debug(
+                    "MNI check: left ear X=%.1f (should be <0), "
+                    "right ear X=%.1f (should be >0)", l[0], r[0])
+            checks.append(hemi_ok)
+
+    if not checks:
+        log.debug("MNI check: no usable landmarks — skipping check")
+        return True
+
+    return all(checks)
 
 
 # =============================================================================
@@ -111,7 +196,7 @@ def run(args, paths: PathManifest) -> None:
     log.info("Landmarks      : %d rows", len(lm_df))
 
     # ------------------------------------------------------------------ #
-    # First conversion attempt
+    # Stage 1 flip check: voxel-space hemisphere check
     # ------------------------------------------------------------------ #
     flip_x = not args.no_flip
     log.info("X flip         : %s (initial)", "ON" if flip_x else "OFF")
@@ -119,9 +204,6 @@ def run(args, paths: PathManifest) -> None:
     result = _attempt(tgt_df, lm_df, flip_x,
                       affine, shape, x_midpoint, t1_ltr)
 
-    # ------------------------------------------------------------------ #
-    # Automatic retry check
-    # ------------------------------------------------------------------ #
     hemi_ok         = result["hemi_correct"]
     ef_in, ef_total = result["ef_bounds"]
     all_oob         = (ef_total > 0) and (ef_in == 0)
@@ -154,7 +236,7 @@ def run(args, paths: PathManifest) -> None:
         else:
             log.warning(
                 "Auto-flip rejected: retry did not improve results. "
-                "Keeping flip_x=%s. Manual review recommended.", flip_x)
+                "Keeping flip_x=%s.", flip_x)
 
     # ------------------------------------------------------------------ #
     # Unpack
@@ -204,13 +286,65 @@ def run(args, paths: PathManifest) -> None:
         raise RuntimeError("Missing ANTs transforms for MNI coordinate warp.")
 
     lm_mm   = result["lm_mm"]
-    lm_df   = read_landmarks(paths.landmarks_csv)
     mni_img = nib.load(str(paths.mni_template))
 
     ef_mni_mm   = _apply_ants_transform(ef_mm,   ef_mask,   paths)
     coil_mni_mm = _apply_ants_transform(coil_mm, coil_mask, paths)
     lm_mni_mm   = _apply_ants_transform(
         lm_mm, np.ones(len(lm_mm), dtype=bool), paths)
+
+    # ------------------------------------------------------------------ #
+    # Stage 2 flip check: MNI landmark sanity check
+    # ------------------------------------------------------------------ #
+    mni_flip_ok = _check_mni_landmarks(lm_mni_mm, lm_df)
+
+    if not mni_flip_ok:
+        log.warning(
+            "MNI landmark sanity check FAILED (flip_x=%s) — "
+            "nasion or ear positions are anatomically implausible. "
+            "Retrying with flip_x=%s.", flip_x, not flip_x)
+
+        retry2       = _attempt(tgt_df, lm_df, not flip_x,
+                                affine, shape, x_midpoint, t1_ltr)
+        retry2_lm_mm = retry2["lm_mm"]
+        retry2_lm_mni = _apply_ants_transform(
+            retry2_lm_mm, np.ones(len(lm_df), dtype=bool), paths)
+        retry2_ok = _check_mni_landmarks(retry2_lm_mni, lm_df)
+
+        if retry2_ok:
+            log.warning(
+                "MNI auto-flip ACCEPTED: flip_x %s → %s  "
+                "(MNI landmarks now anatomically plausible)",
+                flip_x, not flip_x)
+            flip_x      = not flip_x
+            result      = retry2
+            ef_mm       = retry2["ef_mm"]
+            ef_mask     = retry2["ef_mask"]
+            coil_mm     = retry2["coil_mm"]
+            coil_mask   = retry2["coil_mask"]
+            lm_mni_mm   = retry2_lm_mni
+            ef_mni_mm   = _apply_ants_transform(ef_mm,   ef_mask,   paths)
+            coil_mni_mm = _apply_ants_transform(coil_mm, coil_mask, paths)
+            ef_hemi     = label_hemisphere(
+                retry2["ef_vox"][:,   0], x_midpoint, t1_ltr)
+            coil_hemi   = label_hemisphere(
+                retry2["coil_vox"][:, 0], x_midpoint, t1_ltr)
+            # Update native CSV with corrected flip
+            native_df["ef_hemisphere"]   = ef_hemi
+            native_df["coil_hemisphere"] = coil_hemi
+            native_df["flip_x_used"]     = flip_x
+            for axis, idx in [("x", 0), ("y", 1), ("z", 2)]:
+                native_df[f"ef_native_vox_{axis}"] = np.where(
+                    np.isnan(retry2["ef_vox"][:, idx]), np.nan,
+                    np.round(retry2["ef_vox"][:, idx]))
+                native_df[f"ef_native_mm_{axis}"]  = retry2["ef_mm"][:, idx]
+            write_csv(native_df, paths.targets_native)
+            log.info("Native CSV updated with corrected flip.")
+        else:
+            log.warning(
+                "MNI auto-flip REJECTED: neither flip produces plausible MNI "
+                "landmarks. Keeping flip_x=%s. This may indicate a registration "
+                "failure — check T1_in_MNI.nii.gz in FreeView.", flip_x)
 
     ef_mni_vox   = np.full(ef_mni_mm.shape,   np.nan)
     coil_mni_vox = np.full(coil_mni_mm.shape, np.nan)
@@ -264,11 +398,6 @@ def _norm_id(s) -> str:
 
 
 def _filter_df(df: pd.DataFrame, ids: list[str] | None) -> pd.DataFrame:
-    """
-    Return rows matching the requested IDs.
-    Output is ordered to match the order of ids (i.e. --id flag order),
-    not the order rows appear in the NBE file.
-    """
     if ids is None:
         return df.iloc[0:0]
 
@@ -280,7 +409,6 @@ def _filter_df(df: pd.DataFrame, ids: list[str] | None) -> pd.DataFrame:
     mask    = df["id"].apply(_norm_id).isin(id_set)
     matched = df[mask].copy()
 
-    # Sort to match --id flag order
     id_order = {_norm_id(i): pos for pos, i in enumerate(ids)}
     matched["_sort_key"] = matched["id"].apply(
         lambda x: id_order.get(_norm_id(x), 999))
@@ -295,7 +423,6 @@ def _write_summary(
     args,
     paths:     PathManifest,
 ) -> None:
-    """Merge filtered rows from native, MNI, and fsaverage into one summary CSV."""
     if args.ids is None or paths.targets_summary is None:
         return
 
@@ -329,7 +456,6 @@ def _write_summary(
             for x in mni_x
         ]
 
-        # Atlas labels — all atlases
         coords     = mni_source[["ef_mni_mm_x", "ef_mni_mm_y",
                                   "ef_mni_mm_z"]].values
         valid_mask = ~np.isnan(coords).any(axis=1)
@@ -349,7 +475,6 @@ def _write_summary(
         for key in ATLAS_KEYS:
             out[ATLAS_COL_NAMES[key]] = all_labels[key]
 
-        # fsaverage snap columns
         if "snap_distance_mm" in mni_source.columns:
             for ax in ("x", "y", "z"):
                 out[f"fs_{ax}"] = mni_source[f"fs_{ax}"].values
@@ -417,10 +542,6 @@ def _snap_to_fsaverage(
             surface_name = fallback_label
             snapped      = fallback_coords[f_idx]
             dist         = f_dist
-            log.debug(
-                "Row %s: cross-hemisphere snap (%.1f mm → %s, was %.1f mm → %s)",
-                row.get("id", "?"), f_dist, fallback_label, p_dist, primary_label,
-            )
 
         results.append({
             "fs_vertex":        int(vertex_idx),
@@ -491,7 +612,7 @@ def _nearest_vertex(
 
 
 # =============================================================================
-# NBE → native conversion helpers
+# NBE → native conversion
 # =============================================================================
 
 def _attempt(
@@ -499,8 +620,6 @@ def _attempt(
     flip_x: bool,
     affine, shape, x_midpoint, t1_ltr,
 ) -> dict:
-    """One full NBE → voxel → mm conversion attempt for a given flip_x."""
-
     lm_coords = lm_df[["x", "y", "z"]].apply(
         pd.to_numeric, errors="coerce"
     ).values.astype(float)
@@ -580,16 +699,12 @@ def _apply_ants_transform(
 ) -> np.ndarray:
     """
     Transform Nx3 RAS mm → MNI RAS mm via antsApplyTransformsToPoints.
-
-    The NIfTI affine always maps voxels to RAS mm by definition, so
-    mm_ras is already in RAS regardless of image orientation on disk.
-    We negate X and Y to get LPS for ANTs, then negate back after.
+    Negates X and Y for LPS, then negates back after.
     """
     result = np.full(mm_ras.shape, np.nan)
     if not mask.any():
         return result
 
-    # RAS → LPS
     valid_lps = mm_ras[mask].copy()
     valid_lps[:, 0] *= -1
     valid_lps[:, 1] *= -1

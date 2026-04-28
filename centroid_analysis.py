@@ -1,58 +1,54 @@
+
 """
-centroid_analysis.py
-====================
-Group-level centroid analysis and target-coloured glass brain visualization.
+centroid_analysis_site_colored.py
+=================================
 
-Reads a group CSV that has been enriched with intended_area and intended_hemi
-columns (added manually after group_visualize.py output).
+Site-specific centroid analysis and one combined centroid plot.
 
-Produces
---------
-  {prefix}_centroids.csv
-      Per-group centroid MNI coordinates and subject count.
+Purpose
+-------
+Use this when you have multiple sites, e.g. ou1 + ou2, and want ONE combined
+glass-brain plot showing site-specific centroids:
+  - ou1 = Reds
+  - ou2 = Oranges
+  - ou3 = Greens
+  - ou4 = Blues
+  - ou5 = Purples
+  - ou6 = Greys
+  - additional sites cycle through fallback palettes
 
-  {prefix}_distances.csv
-      Per-subject distance from their group centroid, with centroid coords
-      appended for reference.
+Centroids are computed separately for:
+  site x intended_area x intended_hemi
 
-  {prefix}_target_glass_brain.png
-      Static 4-panel glass brain coloured by intended target:
-        L Premotor  → light blue  (#7EC8E3)
-        R Premotor  → dark blue   (#0057A8)
-        L Parietal  → light pink  (#FFB3C6)
-        R Parietal  → red/pink    (#C1003C)
+So, with ou1 and ou2, you get separate centroids for:
+  ou1 L Premotor
+  ou1 R Premotor
+  ou1 L Parietal
+  ou1 R Parietal
+  ou2 L Premotor
+  ou2 R Premotor
+  ou2 L Parietal
+  ou2 R Parietal
 
-  {prefix}_target_glass_brain.html
-      Interactive version of the above.
+Coordinates used for centroid computation:
+  mni_mm_x, mni_mm_y, mni_mm_z
 
-  {prefix}_target_centroids.png
-      Same glass brain with centroid markers added (larger, outlined).
-
-  {prefix}_by_site_{site}.png   (one per site if --by-site is set)
-      Per-site glass brain using the same target colour scheme.
+Snapped atlas columns are preserved in the distance CSV if present, but they are
+not used for centroid coordinates.
 
 Usage
 -----
-  python centroid_analysis.py \\
-      --csv group_viz/all_subjects_mni.csv \\
-      --output-dir group_viz \\
-      --output-prefix hc
+python centroid_analysis_site_colored.py \
+    --csv /path/to/ou1_all_sites_snapped_centroid.csv \
+    --csv /path/to/ou2_all_sites_snapped_centroid.csv \
+    --output-dir /path/to/ou1_ou2/ \
+    --output-prefix ou1_ou2
 
-  # Multiple CSVs (one per site — combined for centroid calc)
-  python centroid_analysis.py \\
-      --csv ou1/all_subjects_mni.csv \\
-      --csv ou2/all_subjects_mni.csv \\
-      --csv ou3/all_subjects_mni.csv \\
-      --output-dir group_viz \\
-      --output-prefix hc \\
-      --by-site
-
-  # Custom target/hemi column names if yours differ
-  python centroid_analysis.py \\
-      --csv all_subjects.csv \\
-      --output-dir ./out \\
-      --target-col intended_area \\
-      --hemi-col   intended_hemi
+Optional:
+  --points-faint     Plot all subject points faintly underneath centroids.
+  --no-points        Plot centroids only.
+  --target-col COL   Default: intended_area
+  --hemi-col COL     Default: intended_hemi
 """
 
 from __future__ import annotations
@@ -60,52 +56,190 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
-import nibabel as nib
 import numpy as np
 import pandas as pd
 from nilearn import plotting
 
+
 # =============================================================================
-# Colour scheme — fixed for all plots
+# Plot settings
 # =============================================================================
 
-# (target, hemi) → hex colour
-TARGET_COLORS: dict[tuple[str, str], str] = {
-    ("Premotor",  "L"): "#7EC8E3",   # light blue
-    ("Premotor",  "R"): "#0057A8",   # dark blue
-    ("Parietal",  "L"): "#FFB3C6",   # light pink
-    ("Parietal",  "R"): "#C1003C",   # red/pink
+# Subject points are intentionally faint so the centroid stars carry the plot.
+POINT_MARKER_SIZE = 8
+POINT_ALPHA = 0.08
+
+# Centroid stars. Black outline keeps light colors readable on white.
+CENTROID_OUTLINE_SIZE = 270
+CENTROID_INNER_SIZE = 165
+
+# Non-flesh, high-contrast cohort palettes.
+#
+# Cohort/site color families:
+#   ou1 = blues
+#   ou2 = purples
+#   ou3 = greens
+#   ou4 = gold/yellow
+#   ou5 = magentas
+#
+# Within each site:
+#   L Premotor  = lighter/saturated family color
+#   R Premotor  = darker family color
+#   L Parietal  = palest family color
+#   R Parietal  = deepest family color
+#
+# Black star outlines are used so the lighter shades remain visible.
+SITE_TARGET_COLORS = {
+    "ou1": {
+        ("Premotor", "L"): "#4CC9F0",  # bright cyan-blue
+        ("Premotor", "R"): "#0057D9",  # strong blue
+        ("Parietal", "L"): "#B9F2FF",  # pale ice blue
+        ("Parietal", "R"): "#002B7F",  # deep navy
+    },
+    "ou2": {
+        ("Premotor", "L"): "#C77DFF",  # bright violet
+        ("Premotor", "R"): "#7B2CBF",  # strong purple
+        ("Parietal", "L"): "#E0AAFF",  # pale lavender
+        ("Parietal", "R"): "#3C096C",  # deep purple
+    },
+    "ou3": {
+        ("Premotor", "L"): "#80ED99",  # bright green
+        ("Premotor", "R"): "#00843D",  # strong green
+        ("Parietal", "L"): "#CCFFCC",  # pale mint
+        ("Parietal", "R"): "#005A2B",  # deep green
+    },
+    "ou4": {
+        ("Premotor", "L"): "#FFD60A",  # bright gold
+        ("Premotor", "R"): "#B8860B",  # dark goldenrod
+        ("Parietal", "L"): "#FFF3B0",  # pale yellow
+        ("Parietal", "R"): "#7A5C00",  # deep olive-gold
+    },
+    "ou5": {
+        ("Premotor", "L"): "#FF5CDA",  # bright magenta
+        ("Premotor", "R"): "#C0007A",  # strong magenta
+        ("Parietal", "L"): "#FFC1EF",  # pale pink-magenta
+        ("Parietal", "R"): "#7A004D",  # deep magenta
+    },
 }
 
-# Fallback for unexpected values — assign grey
-FALLBACK_COLOR = "#AAAAAA"
-
-# Centroid marker style
-CENTROID_MARKER_SIZE  = 80    # nilearn marker_size units
-POINT_MARKER_SIZE     = 15
+FALLBACK_SITE_NAMES = ["ou1", "ou2", "ou3", "ou4", "ou5"]
 
 
-def _get_color(target: str, hemi: str) -> str:
-    return TARGET_COLORS.get((str(target).strip(), str(hemi).strip()),
-                              FALLBACK_COLOR)
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def _normalize_target(value) -> str:
+    """Normalize target names so premotor/parietal become Premotor/Parietal."""
+    s = str(value).strip()
+    lower = s.lower()
+    if lower == "premotor":
+        return "Premotor"
+    if lower == "parietal":
+        return "Parietal"
+    return s
 
 
-def _legend_handles() -> list:
+def _normalize_hemi(value) -> str:
+    """Normalize hemisphere values to L/R when possible."""
+    s = str(value).strip()
+    lower = s.lower()
+    if lower in {"l", "left", "lh"}:
+        return "L"
+    if lower in {"r", "right", "rh"}:
+        return "R"
+    return s
+
+
+def _site_from_path(path: str) -> str:
+    """Fallback site name if no site column exists."""
+    p = Path(path)
+    for part in reversed(p.parts):
+        lower = part.lower()
+        if lower.startswith("ou"):
+            return part
+    return p.stem
+
+
+def _get_site_palette_map(sites: list[str]) -> dict[str, str]:
+    """Map actual site labels to explicit palette names.
+
+    If actual site names are ou1/ou2/etc, they map to themselves.
+    Otherwise, sites are assigned in sorted order to ou1/ou2/ou3/ou4/ou5.
+    """
+    ordered = sorted(str(s) for s in sites)
+    site_map = {}
+    for i, site in enumerate(ordered):
+        if site in SITE_TARGET_COLORS:
+            site_map[site] = site
+        else:
+            site_map[site] = FALLBACK_SITE_NAMES[i % len(FALLBACK_SITE_NAMES)]
+    return site_map
+
+
+def _centroid_color(site: str, target: str, hemi: str, site_cmaps: dict[str, str]) -> str:
+    """Return a non-flesh hex color for one site x target x hemisphere centroid."""
+    site = str(site)
+    palette_name = site_cmaps.get(site, site)
+    target = _normalize_target(target)
+    hemi = _normalize_hemi(hemi)
+
+    palette = SITE_TARGET_COLORS.get(palette_name, SITE_TARGET_COLORS["ou5"])
+    return palette.get((target, hemi), "#000000")
+
+
+def _add_marker_on_top(fig, disp, coord, *, color, marker_size, marker="*", zorder=1000, alpha=1.0):
+    """
+    Add a marker with nilearn, then force any newly-created artists to the front.
+    Nilearn draws onto multiple projected axes, so this is more reliable than
+    passing zorder into add_markers.
+    """
+    before = {ax: set(ax.collections + ax.lines) for ax in fig.axes}
+
+    disp.add_markers(
+        np.asarray(coord),
+        marker_color=color,
+        marker_size=marker_size,
+        marker=marker,
+        alpha=alpha,
+    )
+
+    after = {ax: set(ax.collections + ax.lines) for ax in fig.axes}
+
+    for ax in fig.axes:
+        for artist in after[ax] - before[ax]:
+            artist.set_zorder(zorder)
+
+
+def _legend_handles(centroids: pd.DataFrame, site_cmaps: dict[str, str]) -> list:
+    """Build a centroid legend."""
     handles = []
-    labels  = {
-        ("Premotor",  "L"): "L Premotor",
-        ("Premotor",  "R"): "R Premotor",
-        ("Parietal",  "L"): "L Parietal",
-        ("Parietal",  "R"): "R Parietal",
-    }
-    for (target, hemi), label in labels.items():
-        color = TARGET_COLORS[(target, hemi)]
-        handles.append(mpatches.Patch(color=color, label=label))
+
+    for _, row in centroids.sort_values(["site", "intended_area", "intended_hemi"]).iterrows():
+        site = str(row["site"])
+        target = _normalize_target(row["intended_area"])
+        hemi = _normalize_hemi(row["intended_hemi"])
+        color = _centroid_color(site, target, hemi, site_cmaps)
+
+        handles.append(
+            plt.Line2D(
+                [], [],
+                marker="*",
+                color="black",
+                markerfacecolor=color,
+                markeredgecolor="black",
+                markersize=14,
+                linestyle="None",
+                label=f"{site} {hemi} {target}",
+            )
+        )
+
     return handles
 
 
@@ -115,23 +249,23 @@ def _legend_handles() -> list:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Centroid analysis and target-coloured glass brain plots.",
+        description="Site-specific centroid analysis with one combined site-colored centroid plot.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+
     p.add_argument("--csv", required=True, action="append", dest="csvs",
-                   help="Group CSV with intended_area and intended_hemi columns. "
-                        "Repeat for multiple sites.")
-    p.add_argument("--output-dir",    required=True)
+                   help="Input CSV. Repeat for multiple sites.")
+    p.add_argument("--output-dir", required=True)
     p.add_argument("--output-prefix", default="group")
-    p.add_argument("--target-col",    default="intended_area",
-                   help="Column name for intended target area (default: intended_area)")
-    p.add_argument("--hemi-col",      default="intended_hemi",
-                   help="Column name for intended hemisphere (default: intended_hemi)")
-    p.add_argument("--by-site",       action="store_true",
-                   help="Also produce one glass brain per site, "
-                        "coloured by target within each site.")
-    p.add_argument("--no-plots",      action="store_true",
-                   help="Skip glass brain plots — output CSVs only.")
+    p.add_argument("--target-col", default="intended_area")
+    p.add_argument("--hemi-col", default="intended_hemi")
+
+    point_group = p.add_mutually_exclusive_group()
+    point_group.add_argument("--points-faint", action="store_true", default=True,
+                             help="Plot subject points faintly under centroids. Default.")
+    point_group.add_argument("--no-points", action="store_true",
+                             help="Plot centroids only.")
+
     return p.parse_args()
 
 
@@ -139,104 +273,109 @@ def _parse_args() -> argparse.Namespace:
 # Data loading
 # =============================================================================
 
-def _load_csvs(
-    csv_paths: list[str],
-    target_col: str,
-    hemi_col: str,
-) -> pd.DataFrame:
+def _load_csvs(csv_paths: list[str], target_col: str, hemi_col: str) -> pd.DataFrame:
     dfs = []
+
     for path in csv_paths:
         df = pd.read_csv(path, na_values=["-", " -", "- "])
-        for col in [target_col, hemi_col, "mni_mm_x", "mni_mm_y", "mni_mm_z"]:
-            if col not in df.columns:
-                print(f"ERROR: column '{col}' not found in {path}")
-                print(f"  Available columns: {list(df.columns)}")
-                sys.exit(1)
+
+        required = [target_col, hemi_col, "mni_mm_x", "mni_mm_y", "mni_mm_z"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            print(f"ERROR: missing columns {missing} in {path}")
+            print(f"Available columns: {list(df.columns)}")
+            sys.exit(1)
+
+        if "site" not in df.columns:
+            df["site"] = _site_from_path(path)
+
+        df[target_col] = df[target_col].map(_normalize_target)
+        df[hemi_col] = df[hemi_col].map(_normalize_hemi)
+        df["site"] = df["site"].astype(str)
+
         dfs.append(df)
         print(f"Loaded {len(df)} rows from {path}")
 
     combined = pd.concat(dfs, ignore_index=True)
-    combined = combined.dropna(
-        subset=["mni_mm_x", "mni_mm_y", "mni_mm_z", target_col, hemi_col])
+    combined = combined.dropna(subset=["mni_mm_x", "mni_mm_y", "mni_mm_z", target_col, hemi_col, "site"])
 
-    print(f"Total: {len(combined)} rows with valid coordinates and target labels")
+    print(f"Total: {len(combined)} rows with valid coordinates, site, and target labels")
+    print(f"Sites: {', '.join(sorted(combined['site'].astype(str).unique()))}")
+
     return combined
 
 
 # =============================================================================
-# Centroid computation
+# Centroids and distances
 # =============================================================================
 
-def compute_centroids(
-    df: pd.DataFrame,
-    target_col: str,
-    hemi_col: str,
-) -> pd.DataFrame:
-    """
-    Compute mean MNI coordinate (centroid) for each (target, hemi) group.
-    Returns a DataFrame with one row per group.
-    """
-    groups = df.groupby([target_col, hemi_col])
-
+def compute_site_centroids(df: pd.DataFrame, target_col: str, hemi_col: str) -> pd.DataFrame:
+    """Compute centroids by site x target x hemisphere."""
     rows = []
-    for (target, hemi), grp in groups:
-        coords = grp[["mni_mm_x", "mni_mm_y", "mni_mm_z"]].values
+
+    print("\n=== Computing site-specific centroids ===")
+
+    groups = df.groupby(["site", target_col, hemi_col], dropna=False)
+    for (site, target, hemi), grp in groups:
+        coords = grp[["mni_mm_x", "mni_mm_y", "mni_mm_z"]].astype(float).values
         centroid = coords.mean(axis=0)
+
         rows.append({
-            "intended_area":    target,
-            "intended_hemi":    hemi,
-            "n_subjects":       len(grp),
-            "centroid_x":       round(float(centroid[0]), 3),
-            "centroid_y":       round(float(centroid[1]), 3),
-            "centroid_z":       round(float(centroid[2]), 3),
-            # Standard deviation across subjects
-            "std_x":            round(float(coords[:, 0].std()), 3),
-            "std_y":            round(float(coords[:, 1].std()), 3),
-            "std_z":            round(float(coords[:, 2].std()), 3),
-            # Mean pairwise spread
-            "spread_mm":        round(float(
-                np.mean([np.linalg.norm(c - centroid) for c in coords])), 3),
+            "site": site,
+            "intended_area": target,
+            "intended_hemi": hemi,
+            "n_subjects": int(len(grp)),
+            "centroid_x": round(float(centroid[0]), 3),
+            "centroid_y": round(float(centroid[1]), 3),
+            "centroid_z": round(float(centroid[2]), 3),
+            "std_x": round(float(coords[:, 0].std()), 3),
+            "std_y": round(float(coords[:, 1].std()), 3),
+            "std_z": round(float(coords[:, 2].std()), 3),
+            "spread_mm": round(float(np.mean([np.linalg.norm(c - centroid) for c in coords])), 3),
         })
-        print(f"  {target:12s} {hemi}  n={len(grp):3d}  "
-              f"centroid=[{centroid[0]:6.1f}, {centroid[1]:6.1f}, {centroid[2]:6.1f}]")
+
+        print(
+            f"  {site:8s} {str(target):12s} {str(hemi):2s} "
+            f"n={len(grp):3d} "
+            f"centroid=[{centroid[0]:6.1f}, {centroid[1]:6.1f}, {centroid[2]:6.1f}]"
+        )
 
     return pd.DataFrame(rows)
 
 
-# =============================================================================
-# Distance computation
-# =============================================================================
-
-def compute_distances(
+def compute_site_distances(
     df: pd.DataFrame,
     centroids: pd.DataFrame,
     target_col: str,
     hemi_col: str,
 ) -> pd.DataFrame:
-    """
-    Compute Euclidean distance from each subject's actual stimulation point
-    to their group centroid.
-    """
-    # Build centroid lookup
-    centroid_map: dict[tuple, np.ndarray] = {}
+    """Compute distance from each subject point to its own site x target x hemi centroid."""
+    centroid_map = {}
     for _, row in centroids.iterrows():
-        key = (row["intended_area"], row["intended_hemi"])
-        centroid_map[key] = np.array([
-            row["centroid_x"], row["centroid_y"], row["centroid_z"]])
+        key = (
+            str(row["site"]),
+            _normalize_target(row["intended_area"]),
+            _normalize_hemi(row["intended_hemi"]),
+        )
+        centroid_map[key] = np.array([row["centroid_x"], row["centroid_y"], row["centroid_z"]], dtype=float)
 
     out = df.copy()
-    distances   = []
+    distances = []
     centroid_xs = []
     centroid_ys = []
     centroid_zs = []
 
-    for _, row in df.iterrows():
-        key = (str(row[target_col]).strip(), str(row[hemi_col]).strip())
+    for _, row in out.iterrows():
+        key = (
+            str(row["site"]),
+            _normalize_target(row[target_col]),
+            _normalize_hemi(row[hemi_col]),
+        )
+        pt = np.array([row["mni_mm_x"], row["mni_mm_y"], row["mni_mm_z"]], dtype=float)
+
         if key in centroid_map:
-            c    = centroid_map[key]
-            pt   = np.array([row["mni_mm_x"], row["mni_mm_y"], row["mni_mm_z"]])
-            dist = float(np.linalg.norm(pt - c))
-            distances.append(round(dist, 3))
+            c = centroid_map[key]
+            distances.append(round(float(np.linalg.norm(pt - c)), 3))
             centroid_xs.append(round(float(c[0]), 3))
             centroid_ys.append(round(float(c[1]), 3))
             centroid_zs.append(round(float(c[2]), 3))
@@ -246,204 +385,149 @@ def compute_distances(
             centroid_ys.append(np.nan)
             centroid_zs.append(np.nan)
 
-    out["distance_from_centroid_mm"] = distances
-    out["centroid_x"]                = centroid_xs
-    out["centroid_y"]                = centroid_ys
-    out["centroid_z"]                = centroid_zs
+    out["site_distance_from_centroid_mm"] = distances
+    out["site_centroid_x"] = centroid_xs
+    out["site_centroid_y"] = centroid_ys
+    out["site_centroid_z"] = centroid_zs
 
-    # Summary stats per group
-    print("\nDistance from centroid (mm) — summary:")
-    for (target, hemi), grp in out.groupby([target_col, hemi_col]):
-        dists = grp["distance_from_centroid_mm"].dropna()
-        print(f"  {target:12s} {hemi}  "
-              f"mean={dists.mean():.1f}  "
-              f"std={dists.std():.1f}  "
-              f"min={dists.min():.1f}  "
-              f"max={dists.max():.1f}")
+    print("\n=== Distance from site-specific centroid, mm ===")
+    for (site, target, hemi), grp in out.groupby(["site", target_col, hemi_col]):
+        d = grp["site_distance_from_centroid_mm"].dropna()
+        print(
+            f"  {site:8s} {str(target):12s} {str(hemi):2s} "
+            f"mean={d.mean():5.1f} std={d.std():5.1f} min={d.min():5.1f} max={d.max():5.1f}"
+        )
 
     return out
 
 
 # =============================================================================
-# Glass brain plots
+# Plotting
 # =============================================================================
 
-def _plot_target_brain(
+def plot_combined_site_centroids(
     df: pd.DataFrame,
-    centroids: pd.DataFrame | None,
-    out_path: str,
+    centroids: pd.DataFrame,
+    output_path: str,
     target_col: str,
     hemi_col: str,
-    title: str | None = None,
-    show_centroids: bool = False,
+    plot_points: bool = True,
 ) -> None:
-    """Static 4-panel glass brain coloured by intended target."""
-    fig  = plt.figure(figsize=(14, 4), facecolor="white")
+    """One combined glass-brain plot with all site-specific centroids."""
+    sites = sorted(df["site"].astype(str).unique())
+    site_cmaps = _get_site_palette_map(sites)
+
+    fig = plt.figure(figsize=(16, 4.5), facecolor="white")
     disp = plotting.plot_glass_brain(
-        None, display_mode="lyrz", figure=fig,
-        title=title, annotate=True, black_bg=False,
+        None,
+        display_mode="lyrz",
+        figure=fig,
+        title="Site-specific centroids by cohort and target",
+        annotate=True,
+        black_bg=False,
     )
 
-    # Plot points grouped by colour
-    color_groups: dict[str, list] = {}
-    for _, row in df.iterrows():
-        color = _get_color(row[target_col], row[hemi_col])
-        if color not in color_groups:
-            color_groups[color] = []
-        color_groups[color].append(
-            [row["mni_mm_x"], row["mni_mm_y"], row["mni_mm_z"]])
-
-    for color, pts in color_groups.items():
-        disp.add_markers(np.array(pts),
-                         marker_color=color,
-                         marker_size=POINT_MARKER_SIZE)
-
-    # Centroid markers (larger, same colour)
-    if show_centroids and centroids is not None:
-        for _, crow in centroids.iterrows():
-            color = _get_color(crow["intended_area"], crow["intended_hemi"])
+    # Faint subject points under the centroids.
+    if plot_points:
+        for _, row in df.iterrows():
+            color = _centroid_color(row["site"], row[target_col], row[hemi_col], site_cmaps)
+            coord = np.array([[row["mni_mm_x"], row["mni_mm_y"], row["mni_mm_z"]]], dtype=float)
             disp.add_markers(
-                np.array([[crow["centroid_x"],
-                           crow["centroid_y"],
-                           crow["centroid_z"]]]),
+                coord,
                 marker_color=color,
-                marker_size=CENTROID_MARKER_SIZE,
+                marker_size=POINT_MARKER_SIZE,
+                alpha=POINT_ALPHA,
             )
 
-    fig.legend(handles=_legend_handles(), loc="lower center",
-               ncol=4, fontsize=9, frameon=False,
-               bbox_to_anchor=(0.5, -0.05))
+    # Centroids are drawn last and forced on top.
+    for _, row in centroids.iterrows():
+        color = _centroid_color(row["site"], row["intended_area"], row["intended_hemi"], site_cmaps)
+        coord = np.array([[row["centroid_x"], row["centroid_y"], row["centroid_z"]]], dtype=float)
 
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
-    plt.close()
-    print(f"  Saved: {out_path}")
+        _add_marker_on_top(
+            fig,
+            disp,
+            coord,
+            color="black",
+            marker_size=CENTROID_OUTLINE_SIZE,
+            marker="*",
+            zorder=1000,
+            alpha=1.0,
+        )
+        _add_marker_on_top(
+            fig,
+            disp,
+            coord,
+            color=color,
+            marker_size=CENTROID_INNER_SIZE,
+            marker="*",
+            zorder=1001,
+            alpha=1.0,
+        )
 
+    handles = _legend_handles(centroids, site_cmaps)
+    ncol = min(4, max(1, len(handles)))
+    fig.legend(
+        handles=handles,
+        loc="lower center",
+        ncol=ncol,
+        fontsize=8,
+        frameon=False,
+        bbox_to_anchor=(0.5, -0.10),
+    )
 
-def _plot_target_interactive(
-    df: pd.DataFrame,
-    out_path: str,
-    target_col: str,
-    hemi_col: str,
-) -> None:
-    """Interactive HTML glass brain coloured by intended target."""
-    coords = df[["mni_mm_x", "mni_mm_y", "mni_mm_z"]].values
-    colors = [_get_color(row[target_col], row[hemi_col])
-              for _, row in df.iterrows()]
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    plt.savefig(output_path, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
 
-    view = plotting.view_markers(coords, marker_color=colors,
-                                 marker_size=5)
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    view.save_as_html(out_path)
-    print(f"  Saved: {out_path}")
+    print(f"Saved combined site-centroid plot: {output_path}")
 
 
 # =============================================================================
-# Entry point
+# Main
 # =============================================================================
 
 def main() -> None:
     args = _parse_args()
+
     os.makedirs(args.output_dir, exist_ok=True)
 
-    prefix      = args.output_prefix
-    target_col  = args.target_col
-    hemi_col    = args.hemi_col
+    df = _load_csvs(args.csvs, args.target_col, args.hemi_col)
 
-    # ------------------------------------------------------------------ #
-    # Load data
-    # ------------------------------------------------------------------ #
-    print("\n=== Loading data ===")
-    df = _load_csvs(args.csvs, target_col, hemi_col)
-
-    # ------------------------------------------------------------------ #
-    # Centroids
-    # ------------------------------------------------------------------ #
-    print("\n=== Computing centroids ===")
-    centroids = compute_centroids(df, target_col, hemi_col)
-
-    centroids_path = os.path.join(args.output_dir, f"{prefix}_centroids.csv")
+    centroids = compute_site_centroids(df, args.target_col, args.hemi_col)
+    centroids_path = os.path.join(args.output_dir, f"{args.output_prefix}_site_centroids.csv")
     centroids.to_csv(centroids_path, index=False)
-    print(f"\nCentroids CSV: {centroids_path}")
+    print(f"\nSite centroids CSV: {centroids_path}")
 
-    # ------------------------------------------------------------------ #
-    # Distances
-    # ------------------------------------------------------------------ #
-    print("\n=== Computing distances from centroids ===")
-    df_with_dist = compute_distances(df, centroids, target_col, hemi_col)
+    df_dist = compute_site_distances(df, centroids, args.target_col, args.hemi_col)
+    distances_path = os.path.join(args.output_dir, f"{args.output_prefix}_site_distances.csv")
 
-    distances_path = os.path.join(args.output_dir, f"{prefix}_distances.csv")
+    base_cols = [
+        "subject_id", "site", "mni_mm_x", "mni_mm_y", "mni_mm_z",
+        args.target_col, args.hemi_col,
+        "site_distance_from_centroid_mm",
+        "site_centroid_x", "site_centroid_y", "site_centroid_z",
+    ]
+    atlas_cols = [c for c in df_dist.columns if c.startswith("region_")]
+    out_cols = [c for c in base_cols + atlas_cols if c in df_dist.columns]
+    df_dist[out_cols].to_csv(distances_path, index=False)
+    print(f"Site distances CSV: {distances_path}")
 
-    # Select key output columns
-    base_cols = ["subject_id", "site", "mni_mm_x", "mni_mm_y", "mni_mm_z",
-                 target_col, hemi_col,
-                 "distance_from_centroid_mm",
-                 "centroid_x", "centroid_y", "centroid_z"]
-    # Add atlas cols if present
-    atlas_cols = [c for c in df_with_dist.columns if c.startswith("region_")]
-    out_cols   = [c for c in base_cols + atlas_cols if c in df_with_dist.columns]
+    plot_path = os.path.join(args.output_dir, f"{args.output_prefix}_site_centroids_combined.png")
+    plot_combined_site_centroids(
+        df,
+        centroids,
+        plot_path,
+        args.target_col,
+        args.hemi_col,
+        plot_points=not args.no_points,
+    )
 
-    df_with_dist[out_cols].to_csv(distances_path, index=False)
-    print(f"\nDistances CSV: {distances_path}")
-
-    # ------------------------------------------------------------------ #
-    # Glass brain plots
-    # ------------------------------------------------------------------ #
-    if not args.no_plots:
-        print("\n=== Generating glass brain plots ===")
-
-        # All subjects, coloured by target
-        _plot_target_brain(
-            df, None,
-            os.path.join(args.output_dir, f"{prefix}_target_glass_brain.png"),
-            target_col, hemi_col,
-            title="Stimulation sites by intended target",
-        )
-
-        # Same with centroids overlaid
-        _plot_target_brain(
-            df, centroids,
-            os.path.join(args.output_dir, f"{prefix}_target_centroids.png"),
-            target_col, hemi_col,
-            title="Stimulation sites + group centroids",
-            show_centroids=True,
-        )
-
-        # Interactive HTML
-        _plot_target_interactive(
-            df,
-            os.path.join(args.output_dir, f"{prefix}_target_glass_brain.html"),
-            target_col, hemi_col,
-        )
-
-        # Per-site plots
-        if args.by_site and "site" in df.columns:
-            for site in sorted(df["site"].unique()):
-                site_df = df[df["site"] == site]
-                _plot_target_brain(
-                    site_df, centroids,
-                    os.path.join(args.output_dir,
-                                 f"{prefix}_target_{site}.png"),
-                    target_col, hemi_col,
-                    title=f"{site} — coloured by intended target",
-                    show_centroids=True,
-                )
-
-    # ------------------------------------------------------------------ #
-    # Summary
-    # ------------------------------------------------------------------ #
     print("\n" + "=" * 60)
-    print(f"Output directory : {args.output_dir}")
-    print(f"Centroids CSV    : {prefix}_centroids.csv")
-    print(f"Distances CSV    : {prefix}_distances.csv")
-    if not args.no_plots:
-        print(f"Glass brain PNG  : {prefix}_target_glass_brain.png")
-        print(f"With centroids   : {prefix}_target_centroids.png")
-        print(f"Interactive HTML : {prefix}_target_glass_brain.html")
-        if args.by_site:
-            sites = sorted(df["site"].unique())
-            for s in sites:
-                print(f"Site plot        : {prefix}_target_{s}.png")
+    print(f"Output directory       : {args.output_dir}")
+    print(f"Site centroids CSV     : {os.path.basename(centroids_path)}")
+    print(f"Site distances CSV     : {os.path.basename(distances_path)}")
+    print(f"Combined centroid plot : {os.path.basename(plot_path)}")
     print("=" * 60)
 
 
